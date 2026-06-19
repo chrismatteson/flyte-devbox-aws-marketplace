@@ -213,6 +213,15 @@ Resources:
                 Resource: "*"
                 Condition:
                   StringEquals: {cloudwatch:namespace: FlyteDevbox}
+              # Boot-time fetch of large assets (idle agent, Envoy config) that
+              # live in SSM Parameters to keep EC2 user-data under its 16 KB limit.
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/flyte/*"
+              # Self-attach the data volume at boot (no CFN attachment).
+              - Effect: Allow
+                Action: [ec2:AttachVolume, ec2:DescribeVolumes]
+                Resource: "*"
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -283,10 +292,10 @@ Resources:
     Properties:
       GroupId: !Ref InstanceSecurityGroup
       IpProtocol: tcp
-      FromPort: 80
-      ToPort: 80
+      FromPort: 8080
+      ToPort: 8080
       SourceSecurityGroupId: !Ref AlbSecurityGroup
-      Description: From ALB only
+      Description: From ALB only (to the on-host Envoy auth proxy)
 
   # -------------------------------------------------------------------------
   # Dedicated EBS volume for /var/lib/docker. Survives EC2 replacement; daily
@@ -363,26 +372,46 @@ Resources:
                 AWS_REGION="${AwsRegion}"
                 DEVBOX_IMAGE="${DevboxImage}"
                 DATA_DEVICE="${DataDevice}"
+                DATA_VOLUME_ID="${DataVolumeId}"
+                IDLE_AGENT_PARAM="${IdleAgentParamName}"
+                GPU_SETUP_PARAM="${GpuSetupParamName}"
 
                 IMDS_TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
                 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 
                 export DEBIAN_FRONTEND=noninteractive
 
-                # Mount data volume at /var/lib/docker
-                mkdir -p /var/lib/docker
-                if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
-                  mkfs.ext4 -L flyte-data "$DATA_DEVICE"
-                fi
-                if ! grep -q flyte-data /etc/fstab; then
-                  echo "LABEL=flyte-data /var/lib/docker ext4 defaults,nofail 0 2" >> /etc/fstab
-                fi
-                mount -a
-
-                # Docker + Python (for agent)
-                if ! command -v docker >/dev/null; then
+                # Base tooling + AWS CLI v2 first (needed to self-attach the data
+                # volume below). Ubuntu 24.04 has no installable 'awscli' apt pkg.
+                if ! command -v aws >/dev/null; then
                   apt-get update
-                  apt-get install -y ca-certificates curl gnupg python3-pip python3-venv jq
+                  apt-get install -y ca-certificates curl gnupg python3-pip python3-venv jq unzip
+                  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+                  unzip -q /tmp/awscliv2.zip -d /tmp
+                  /tmp/aws/install
+                  rm -rf /tmp/aws /tmp/awscliv2.zip
+                fi
+
+                # Self-attach the data volume by ID (no CFN attachment -> instance is
+                # freely replaceable). Best-effort; prod state is external (RDS/S3).
+                mkdir -p /var/lib/docker
+                for i in $(seq 1 60); do
+                  owner=$(aws ec2 describe-volumes --volume-ids "$DATA_VOLUME_ID" --region "$AWS_REGION" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null || echo "")
+                  [ "$owner" = "$INSTANCE_ID" ] && break
+                  aws ec2 attach-volume --volume-id "$DATA_VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf --region "$AWS_REGION" >/dev/null 2>&1 && break
+                  sleep 5
+                done
+                for i in $(seq 1 30); do [ -e "$DATA_DEVICE" ] && break; sleep 2; done
+                if [ -e "$DATA_DEVICE" ]; then
+                  blkid "$DATA_DEVICE" >/dev/null 2>&1 || mkfs.ext4 -L flyte-data "$DATA_DEVICE"
+                  grep -q flyte-data /etc/fstab || echo "LABEL=flyte-data /var/lib/docker ext4 defaults,nofail 0 2" >> /etc/fstab
+                  mount -a || true
+                else
+                  echo "data volume not attached; using root volume for /var/lib/docker"
+                fi
+
+                # Docker
+                if ! command -v docker >/dev/null; then
                   install -m 0755 -d /etc/apt/keyrings
                   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
                   chmod a+r /etc/apt/keyrings/docker.gpg
@@ -393,6 +422,19 @@ Resources:
                   apt-get update
                   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
                   systemctl enable --now docker
+                fi
+
+                # GPU: if an NVIDIA device is present (PCI vendor 0x10de), install the
+                # driver + container toolkit (from SSM, to keep user-data small),
+                # switch to the gpu image variant, and pass --gpus all to the devbox.
+                # No instance-type list — pure hardware detection. Dormant on CPU nodes.
+                GPU_FLAG=""
+                if grep -qil 10de /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+                  echo "NVIDIA GPU detected; enabling GPU mode"
+                  aws ssm get-parameter --name "$GPU_SETUP_PARAM" --region "$AWS_REGION" --query Parameter.Value --output text > /tmp/gpu-setup.sh
+                  bash /tmp/gpu-setup.sh || echo "gpu setup reported errors (continuing)"
+                  GPU_FLAG="--gpus all"
+                  DEVBOX_IMAGE=$(echo "$DEVBOX_IMAGE" | sed 's/:latest$/:gpu-latest/')
                 fi
 
                 # No 999-extra-config.yaml override. The devbox runs with chart
@@ -411,14 +453,91 @@ Resources:
                 mkdir -p /etc/flyte-devbox
                 : > /etc/flyte-devbox/config.yaml
 
-                # Helper: write the minimum chart override every boot. The
-                # chart's signedURL.stowConfigOverride.endpoint defaults to
-                # 'http://localhost:30002' (works only when SDK runs on the
-                # same machine as the devbox). For remote `flyte run` we must
-                # point it at the EC2's current public hostname.
+                # Prod-mode wiring parameters (DB_* / BUCKET_* are "none" outside
+                # Prod). The render script below uses these to point Flyte at
+                # external S3 + RDS in Prod mode. See docs/PROD_WIRING.md.
+                cat > /etc/flyte-devbox/render.env <<EOF
+                PROD_MODE=${ProdMode}
+                BUCKET_NAME=${BucketName}
+                DB_HOST=${DbHost}
+                DB_PORT=${DbPort}
+                DB_NAME=flyte
+                DB_USER=flyte
+                DB_SECRET_ARN=${DbSecretArn}
+                API_KEY_SECRET_ARN=${ApiKeySecretArn}
+                ENVOY_PARAM=${EnvoyParamName}
+                RENDER_REGION=${AwsRegion}
+                EOF
+                chmod 0600 /etc/flyte-devbox/render.env
+
+                # Helper: render /var/lib/flyte/config/config.yaml (the devbox's
+                # 999-extra-config override, loaded last so it wins) on every boot.
+                #   - Prod mode: full external-backend override — S3 for the object
+                #     store (replaces in-cluster rustfs) and RDS Postgres for the
+                #     runs DB (replaces embedded postgres). Embedded postgres + rustfs
+                #     still run (the flyte-binary wait-for-db initContainer probes
+                #     postgresql.flyte) but are unused.
+                #   - Eval mode: just point signedURL at the EC2 public hostname so
+                #     remote `flyte run` uploads bundles to the rustfs NodePort.
                 cat > /usr/local/bin/flyte-render-override.sh <<'HELPER_EOF'
                 #!/bin/bash
                 set -euo pipefail
+                source /etc/flyte-devbox/render.env
+
+                if [ "$PROD_MODE" = "1" ]; then
+                  PW=$(aws secretsmanager get-secret-value \
+                         --secret-id "$DB_SECRET_ARN" --region "$RENDER_REGION" \
+                         --query SecretString --output text \
+                       | python3 -c 'import sys,json; print(json.load(sys.stdin)["password"])')
+                  cat > /etc/flyte-devbox/config.yaml <<EOF
+                runs:
+                  storagePrefix: s3://$BUCKET_NAME
+                  database:
+                    postgres:
+                      host: $DB_HOST
+                      port: $DB_PORT
+                      dbName: $DB_NAME
+                      user: $DB_USER
+                      username: $DB_USER
+                      password: "$PW"
+                      options: sslmode=require
+                storage:
+                  type: stow
+                  stow:
+                    kind: s3
+                    config:
+                      region: $RENDER_REGION
+                      auth_type: iam
+                      endpoint: ""
+                      disable_ssl: false
+                      v2_signing: false
+                      access_key_id: ""
+                      secret_key: ""
+                  container: $BUCKET_NAME
+                  signedURL:
+                    stowConfigOverride:
+                      endpoint: ""
+                plugins:
+                  k8s:
+                    default-env-vars:
+                    - AWS_REGION: $RENDER_REGION
+                    - AWS_DEFAULT_REGION: $RENDER_REGION
+                    - _U_EP_OVERRIDE: flyte-binary-http.flyte:8090
+                    - _U_INSECURE: "true"
+                    - _U_USE_ACTIONS: "1"
+                internalApps:
+                  defaultEnvVars:
+                  - AWS_REGION: $RENDER_REGION
+                  - AWS_DEFAULT_REGION: $RENDER_REGION
+                  - _U_EP_OVERRIDE: flyte-binary-http.flyte:8090
+                  - _U_INSECURE: "true"
+                  - _U_USE_ACTIONS: "1"
+                EOF
+                  echo "rendered Prod override (S3=$BUCKET_NAME RDS=$DB_HOST)"
+                  exit 0
+                fi
+
+                # Eval mode: point signed URLs at the current public hostname.
                 TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
                 HOST=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-hostname)
                 if [ -z "$HOST" ]; then
@@ -434,6 +553,61 @@ Resources:
                 EOF
                 HELPER_EOF
                 chmod 0755 /usr/local/bin/flyte-render-override.sh
+
+                # Auth proxy (Prod only): an on-EC2 Envoy that sits between the ALB
+                # and the devbox and requires a static API key on every UI + gRPC
+                # request (Bearer for the CLI, HTTP Basic for the browser). The
+                # 'apikey' secret field is a COMMA-SEPARATED list of valid tokens;
+                # this builds one Bearer + one Basic Lua-table entry per token and
+                # substitutes them into the Envoy config's __OKENTRIES__ marker.
+                # /healthz + /readyz are exempt so ALB health checks pass. Flyte 2
+                # OSS has no native auth; this is the gate. Add/rotate tokens by
+                # editing the secret (see docs/AUTH.md) and restarting this service.
+                cat > /usr/local/bin/flyte-render-authproxy.sh <<'AUTHPROXY_EOF'
+                #!/bin/bash
+                set -euo pipefail
+                source /etc/flyte-devbox/render.env
+                if [ "$PROD_MODE" != "1" ]; then
+                  exit 0
+                fi
+                APIKEYS=$(aws secretsmanager get-secret-value \
+                            --secret-id "$API_KEY_SECRET_ARN" --region "$RENDER_REGION" \
+                            --query SecretString --output text \
+                          | python3 -c 'import sys,json; print(json.load(sys.stdin)["apikey"])')
+                ENTRIES=""
+                for t in $(echo "$APIKEYS" | tr ',' ' '); do
+                  b=$(printf 'flyte:%s' "$t" | base64 | tr -d '\n')
+                  ENTRIES="$ENTRIES['Bearer $t']=true,['Basic $b']=true,"
+                done
+                aws ssm get-parameter --name "$ENVOY_PARAM" --region "$RENDER_REGION" \
+                  --query Parameter.Value --output text > /etc/flyte-devbox/envoy.yaml
+                sed -i "s|__OKENTRIES__|$ENTRIES|g" /etc/flyte-devbox/envoy.yaml
+                chmod 0600 /etc/flyte-devbox/envoy.yaml
+                echo "rendered Envoy auth-proxy config"
+                AUTHPROXY_EOF
+                chmod 0755 /usr/local/bin/flyte-render-authproxy.sh
+
+                cat > /etc/systemd/system/flyte-auth-proxy.service <<'PROXYUNIT_EOF'
+                [Unit]
+                Description=Flyte auth proxy (Envoy) - static API key gate for UI + gRPC
+                After=flyte-devbox.service network-online.target
+                Wants=network-online.target
+
+                [Service]
+                Type=simple
+                Restart=on-failure
+                RestartSec=10
+                ExecStartPre=-/usr/bin/docker rm -f flyte-auth-proxy
+                ExecStartPre=/usr/local/bin/flyte-render-authproxy.sh
+                # Single line on purpose (systemd preserves leading whitespace of
+                # `\`-continued lines). --entrypoint envoy bypasses the image's
+                # docker-entrypoint.sh, which mangles the `-c <path>` argument.
+                ExecStart=/usr/bin/docker run --rm --name flyte-auth-proxy --network host --entrypoint envoy --volume /etc/flyte-devbox/envoy.yaml:/etc/envoy/envoy.yaml:ro envoyproxy/envoy:v1.34-latest -c /etc/envoy/envoy.yaml
+                ExecStop=/usr/bin/docker stop -t 10 flyte-auth-proxy
+
+                [Install]
+                WantedBy=multi-user.target
+                PROXYUNIT_EOF
 
                 cat > /etc/systemd/system/flyte-devbox.service <<UNIT_EOF
                 [Unit]
@@ -466,6 +640,7 @@ Resources:
                   --publish 30003:30003 \\
                   --publish 8081:30081 \\
                   --publish 6443:6443 \\
+                  $GPU_FLAG \\
                   $DEVBOX_IMAGE
                 ExecStop=/usr/bin/docker stop -t 30 flyte-devbox
 
@@ -475,85 +650,8 @@ Resources:
 
                 mkdir -p /var/lib/flyte-devbox-kube /opt/flyte-idle-agent /etc/flyte-idle-agent /var/lib/flyte-idle-agent
 
-                cat > /opt/flyte-idle-agent/flyte_idle_agent.py <<'AGENT_EOF'
-                """Idle polling agent.
-
-                Every minute, asks Flyte if any execution is in an active phase. If yes,
-                idle = 0. Else, idle += 1. Publishes IdleMinutes to CloudWatch. A
-                CloudWatch alarm on the metric drives the stop lambda.
-                """
-                from __future__ import annotations
-                import asyncio, logging, os, time
-                from pathlib import Path
-                import boto3, flyte
-                from flyte.models import ActionPhase
-                from flyte.remote import Run
-
-                _ENDPOINT = os.environ.get("FLYTE_ENDPOINT", "localhost:30080")
-                _POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
-                _METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "FlyteDevbox")
-                _INSTANCE_ID = os.environ["INSTANCE_ID"]
-                _REGION = os.environ["AWS_REGION"]
-                _STATE_FILE = Path("/var/lib/flyte-idle-agent/state")
-                _ACTIVE_PHASES: tuple[ActionPhase, ...] = (
-                    ActionPhase.QUEUED,
-                    ActionPhase.WAITING_FOR_RESOURCES,
-                    ActionPhase.INITIALIZING,
-                    ActionPhase.RUNNING,
-                )
-
-                logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-                log = logging.getLogger("flyte-idle-agent")
-
-                def _read_state() -> int:
-                    try: return int(_STATE_FILE.read_text().strip())
-                    except (FileNotFoundError, ValueError): return 0
-
-                def _write_state(v: int) -> None:
-                    _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    _STATE_FILE.write_text(str(v))
-
-                async def _any_active_runs() -> bool:
-                    async for _ in Run.listall.aio(in_phase=_ACTIVE_PHASES, limit=1):
-                        return True
-                    return False
-
-                def _publish(cw, idle_minutes: int) -> None:
-                    cw.put_metric_data(
-                        Namespace=_METRIC_NAMESPACE,
-                        MetricData=[{
-                            "MetricName": "IdleMinutes",
-                            "Dimensions": [{"Name": "InstanceId", "Value": _INSTANCE_ID}],
-                            "Value": float(idle_minutes),
-                            "Unit": "Count",
-                        }],
-                    )
-
-                async def _poll_once(cw, idle_minutes: int) -> int:
-                    try: active = await _any_active_runs()
-                    except Exception:
-                        log.exception("query failed; idle unchanged")
-                        return idle_minutes
-                    new_value = 0 if active else idle_minutes + max(1, _POLL_INTERVAL_SECONDS // 60)
-                    try: _publish(cw, new_value)
-                    except Exception: log.exception("publish failed")
-                    _write_state(new_value)
-                    log.info("idle_minutes=%d active=%s", new_value, active)
-                    return new_value
-
-                async def _main() -> None:
-                    flyte.init(endpoint=_ENDPOINT, insecure=True)
-                    cw = boto3.client("cloudwatch", region_name=_REGION)
-                    idle_minutes = _read_state()
-                    log.info("starting endpoint=%s poll=%ss state=%d", _ENDPOINT, _POLL_INTERVAL_SECONDS, idle_minutes)
-                    while True:
-                        t0 = time.monotonic()
-                        idle_minutes = await _poll_once(cw, idle_minutes)
-                        await asyncio.sleep(max(0.0, _POLL_INTERVAL_SECONDS - (time.monotonic() - t0)))
-
-                if __name__ == "__main__":
-                    asyncio.run(_main())
-                AGENT_EOF
+                aws ssm get-parameter --name "$IDLE_AGENT_PARAM" --region "$AWS_REGION" \
+                  --query Parameter.Value --output text > /opt/flyte-idle-agent/flyte_idle_agent.py
                 chmod 0755 /opt/flyte-idle-agent/flyte_idle_agent.py
 
                 cat > /etc/flyte-idle-agent/env <<EOF
@@ -602,6 +700,14 @@ Resources:
                   sleep 5
                 done
 
+                # Prod only: start the Envoy auth proxy (ALB -> :8080 -> devbox:80,
+                # static API key required). Pre-pull so the systemd start is fast.
+                if [ "${ProdMode}" = "1" ]; then
+                  docker pull envoyproxy/envoy:v1.34-latest || true
+                  systemctl enable flyte-auth-proxy.service
+                  systemctl start flyte-auth-proxy.service
+                fi
+
                 systemctl enable flyte-idle-agent.service
                 systemctl start flyte-idle-agent.service
 
@@ -609,7 +715,205 @@ Resources:
               - AwsRegion: !Ref AWS::Region
                 DevboxImage: !Ref DevboxImage
                 DataDevice: /dev/nvme1n1
+                ProdMode: !If [IsProd, "1", "0"]
+                BucketName: !If [IsProd, !Ref DataBucket, "none"]
+                DbHost: !If [IsProd, !GetAtt DbInstance.Endpoint.Address, "none"]
+                DbPort: !If [IsProd, !GetAtt DbInstance.Endpoint.Port, "5432"]
+                DbSecretArn: !If [IsProd, !Ref DbPasswordSecret, "none"]
+                ApiKeySecretArn: !If [IsProd, !Ref ApiKeySecret, "none"]
+                IdleAgentParamName: !Ref IdleAgentScriptParam
+                EnvoyParamName: !If [IsProd, !Ref EnvoyConfigParam, "none"]
+                DataVolumeId: !Ref DataVolume
+                GpuSetupParamName: !Ref GpuSetupScriptParam
 
+  # ------------------------------------------------------------------------
+  # Large boot assets stored as SSM Parameters (not in EC2 user-data, which
+  # has a hard 16 KB limit). Fetched at boot via the instance role.
+  # ------------------------------------------------------------------------
+  # NVIDIA driver + container toolkit installer, fetched + run by user-data only
+  # when an NVIDIA GPU is detected. Configures the docker nvidia runtime so
+  # `docker run --gpus all` (the devbox GPU mode) works.
+  GpuSetupScriptParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/flyte/gpu-setup.sh"
+      Type: String
+      Tier: Standard
+      Value: |
+        #!/bin/bash
+        set -uo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        # NVIDIA driver (DKMS; builds against the running kernel).
+        apt-get update
+        apt-get install -y ubuntu-drivers-common
+        ubuntu-drivers install --gpgpu || apt-get install -y nvidia-driver-550-server || true
+        # nvidia-container-toolkit (configures the docker runtime for --gpus all)
+        install -d -m 0755 /usr/share/keyrings
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+          | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+          | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+          > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+        apt-get update
+        apt-get install -y nvidia-container-toolkit
+        nvidia-ctk runtime configure --runtime=docker
+        systemctl restart docker
+        modprobe nvidia || true
+
+  IdleAgentScriptParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/flyte/idle-agent.py"
+      Type: String
+      Tier: Standard
+      Value: |
+        """Idle polling agent.
+
+        Every minute, asks Flyte if any execution is in an active phase. If yes,
+        idle = 0. Else, idle += 1. Publishes IdleMinutes to CloudWatch. A
+        CloudWatch alarm on the metric drives the stop lambda.
+        """
+        from __future__ import annotations
+        import asyncio, logging, os, time
+        from pathlib import Path
+        import boto3, flyte
+        from flyte.models import ActionPhase
+        from flyte.remote import Run
+
+        _ENDPOINT = os.environ.get("FLYTE_ENDPOINT", "localhost:30080")
+        _POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
+        _METRIC_NAMESPACE = os.environ.get("METRIC_NAMESPACE", "FlyteDevbox")
+        _INSTANCE_ID = os.environ["INSTANCE_ID"]
+        _REGION = os.environ["AWS_REGION"]
+        _STATE_FILE = Path("/var/lib/flyte-idle-agent/state")
+        _ACTIVE_PHASES: tuple[ActionPhase, ...] = (
+            ActionPhase.QUEUED,
+            ActionPhase.WAITING_FOR_RESOURCES,
+            ActionPhase.INITIALIZING,
+            ActionPhase.RUNNING,
+        )
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        log = logging.getLogger("flyte-idle-agent")
+
+        def _read_state() -> int:
+            try: return int(_STATE_FILE.read_text().strip())
+            except (FileNotFoundError, ValueError): return 0
+
+        def _write_state(v: int) -> None:
+            _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _STATE_FILE.write_text(str(v))
+
+        async def _any_active_runs() -> bool:
+            async for _ in Run.listall.aio(in_phase=_ACTIVE_PHASES, limit=1):
+                return True
+            return False
+
+        def _publish(cw, idle_minutes: int) -> None:
+            cw.put_metric_data(
+                Namespace=_METRIC_NAMESPACE,
+                MetricData=[{
+                    "MetricName": "IdleMinutes",
+                    "Dimensions": [{"Name": "InstanceId", "Value": _INSTANCE_ID}],
+                    "Value": float(idle_minutes),
+                    "Unit": "Count",
+                }],
+            )
+
+        async def _poll_once(cw, idle_minutes: int) -> int:
+            try: active = await _any_active_runs()
+            except Exception:
+                log.exception("query failed; idle unchanged")
+                return idle_minutes
+            new_value = 0 if active else idle_minutes + max(1, _POLL_INTERVAL_SECONDS // 60)
+            try: _publish(cw, new_value)
+            except Exception: log.exception("publish failed")
+            _write_state(new_value)
+            log.info("idle_minutes=%d active=%s", new_value, active)
+            return new_value
+
+        async def _main() -> None:
+            flyte.init(endpoint=_ENDPOINT, insecure=True)
+            cw = boto3.client("cloudwatch", region_name=_REGION)
+            idle_minutes = _read_state()
+            log.info("starting endpoint=%s poll=%ss state=%d", _ENDPOINT, _POLL_INTERVAL_SECONDS, idle_minutes)
+            while True:
+                t0 = time.monotonic()
+                idle_minutes = await _poll_once(cw, idle_minutes)
+                await asyncio.sleep(max(0.0, _POLL_INTERVAL_SECONDS - (time.monotonic() - t0)))
+
+        if __name__ == "__main__":
+            asyncio.run(_main())
+
+  EnvoyConfigParam:
+    Type: AWS::SSM::Parameter
+    Condition: IsProd
+    Properties:
+      Name: !Sub "/${AWS::StackName}/flyte/envoy.yaml"
+      Type: String
+      Tier: Standard
+      Description: Envoy auth-proxy config template (__APIKEY__/__BASIC__ substituted at boot).
+      Value: |
+        admin:
+          address:
+            socket_address: { address: 127.0.0.1, port_value: 9901 }
+        static_resources:
+          listeners:
+          - name: ingress
+            address:
+              socket_address: { address: 0.0.0.0, port_value: 8080 }
+            filter_chains:
+            - filters:
+              - name: envoy.filters.network.http_connection_manager
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                  stat_prefix: ingress
+                  codec_type: AUTO
+                  stream_idle_timeout: 0s
+                  route_config:
+                    name: local
+                    virtual_hosts:
+                    - name: all
+                      domains: ["*"]
+                      routes:
+                      - match: { prefix: "/" }
+                        route: { cluster: devbox, timeout: 0s }
+                  http_filters:
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          -- Valid credentials are rendered in at boot from the API-key
+                          -- secret (one Bearer + one Basic entry per token).
+                          local ok = {__OKENTRIES__}
+                          function envoy_on_request(handle)
+                            local p = handle:headers():get(":path") or ""
+                            if p == "/healthz" or p == "/readyz" then return end
+                            local a = handle:headers():get("authorization") or ""
+                            if ok[a] then return end
+                            handle:respond({[":status"] = "401", ["www-authenticate"] = "Basic realm=\"flyte\"", ["content-type"] = "text/plain"}, "unauthorized\n")
+                          end
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          clusters:
+          - name: devbox
+            connect_timeout: 5s
+            type: STATIC
+            lb_policy: ROUND_ROBIN
+            typed_extension_protocol_options:
+              envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+                "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+                explicit_http_config:
+                  http2_protocol_options: {}
+            load_assignment:
+              cluster_name: devbox
+              endpoints:
+              - lb_endpoints:
+                - endpoint:
+                    address:
+                      socket_address: { address: 127.0.0.1, port_value: 80 }
   Instance:
     Type: AWS::EC2::Instance
     Properties:
@@ -618,9 +922,10 @@ Resources:
         Version: !GetAtt LaunchTemplate.LatestVersionNumber
       SubnetId: !Ref PublicSubnet
       AvailabilityZone: !Select [0, !GetAZs ""]
-      Volumes:
-        - VolumeId: !Ref DataVolume
-          Device: /dev/sdf
+      # The data volume is NOT attached here: user-data self-attaches it by ID at
+      # boot. This keeps the instance freely replaceable (user-data changes apply
+      # via in-place update-stack) instead of failing the EBS attach during the
+      # create-before-delete replacement window.
       Tags:
         - Key: Name
           Value: !Ref AWS::StackName
@@ -690,22 +995,15 @@ Resources:
 
           def _flip_to_wake():
               lb_arn = os.environ["LOAD_BALANCER_ARN"]
-              ec2_tg = os.environ["EC2_TARGET_GROUP_ARN"]
               wake_tg = os.environ["WAKE_TARGET_GROUP_ARN"]
               listeners = elbv2.describe_listeners(LoadBalancerArn=lb_arn)["Listeners"]
               for lst in listeners:
                   if lst["Port"] == 443:
+                      # Single-TG forward (ec2-tg stays health-checked via the
+                      # keep-alive listener rule, not via this action).
                       elbv2.modify_listener(
                           ListenerArn=lst["ListenerArn"],
-                          DefaultActions=[{
-                              "Type": "forward",
-                              "ForwardConfig": {
-                                  "TargetGroups": [
-                                      {"TargetGroupArn": ec2_tg, "Weight": 0},
-                                      {"TargetGroupArn": wake_tg, "Weight": 1},
-                                  ],
-                              },
-                          }],
+                          DefaultActions=[{"Type": "forward", "TargetGroupArn": wake_tg}],
                       )
                       log.info("listener flipped to wake-tg")
                       break
@@ -859,7 +1157,10 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       TargetType: instance
-      Port: 80
+      # Port 8080 = the on-host Envoy auth proxy, which enforces the API key and
+      # forwards (h2c) to the devbox on :80. Health checks hit Envoy's /healthz
+      # passthrough (exempt from auth) so ALB can see real devbox health.
+      Port: 8080
       Protocol: HTTP
       ProtocolVersion: HTTP2   # supports both REST and gRPC over HTTP/2
       HealthCheckPath: /healthz
@@ -869,7 +1170,7 @@ Resources:
       Matcher: { HttpCode: "200-499" }
       Targets:
         - Id: !Ref Instance
-          Port: 80
+          Port: 8080
 
   HttpsListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -880,19 +1181,20 @@ Resources:
       Protocol: HTTPS
       Certificates:
         - CertificateArn: !Ref AlbCertificate
-      # In WantsProdWake mode, both target groups stay attached at all times so
-      # ALB keeps running ec2-tg health checks. The active TG is the one with
-      # Weight 1; the Wake/Stop lambdas swap the weights. In always-on mode
-      # (AutoStop=No), we forward directly to ec2-tg with no wake mechanism.
+      # The default action is a SINGLE-target-group forward, swapped wholesale by
+      # the wake/stop lambdas. We can't use a weighted multi-TG forward here:
+      # ec2-tg is ProtocolVersion HTTP2 (for gRPC) and wake-tg is a Lambda TG
+      # (HTTP1 only), and ALB rejects a multi-TG forward whose target groups have
+      # different protocol-versions. To still keep ec2-tg health-checked while the
+      # default points at the wake lambda, Ec2KeepAliveRule (below) references
+      # ec2-tg on an unused path so ALB never stops health-checking it.
+      # WantsProdWake: start on wake-tg (serves the "starting" page until the EC2
+      # is healthy, then the wake lambda flips the default to ec2-tg).
+      # Always-on (AutoStop=No): forward straight to ec2-tg.
       DefaultActions: !If
         - WantsProdWake
         - - Type: forward
-            ForwardConfig:
-              TargetGroups:
-                - TargetGroupArn: !Ref Ec2TargetGroup
-                  Weight: 0
-                - TargetGroupArn: !Ref WakeTargetGroup
-                  Weight: 1
+            TargetGroupArn: !Ref WakeTargetGroup
         - - Type: forward
             TargetGroupArn: !Ref Ec2TargetGroup
 
@@ -934,6 +1236,9 @@ Resources:
                   - elasticloadbalancing:DescribeListeners
                   - elasticloadbalancing:ModifyListener
                 Resource: "*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecret
 
   WakeLambda:
     Type: AWS::Lambda::Function
@@ -948,13 +1253,16 @@ Resources:
           INSTANCE_ID: !Ref Instance
           LOAD_BALANCER_ARN: !Ref LoadBalancer
           EC2_TARGET_GROUP_ARN: !Ref Ec2TargetGroup
+          API_KEY_SECRET_ARN: !Ref ApiKeySecret
       Code:
         ZipFile: |
           """Prod-mode wake handler. ALB targets this lambda while the EC2 is
-          stopped. On invoke: start the EC2 if stopped; once ec2-tg has a
-          healthy target, flip the listener so the next request hits the EC2
-          directly. Until then, return a 'starting...' page that auto-refreshes."""
-          import logging, os
+          stopped. On invoke: first require the static API key (same key the
+          on-host Envoy enforces) so only authenticated callers can wake (and
+          bill) the box; then start the EC2 if stopped; once ec2-tg has a healthy
+          target, flip the listener so the next request hits the EC2 directly.
+          Until then, return a 'starting...' page that auto-refreshes."""
+          import base64, json, logging, os
           import boto3
 
           log = logging.getLogger(); log.setLevel(logging.INFO)
@@ -962,9 +1270,42 @@ Resources:
           INSTANCE_ID = os.environ["INSTANCE_ID"]
           LOAD_BALANCER_ARN = os.environ["LOAD_BALANCER_ARN"]
           EC2_TG_ARN = os.environ["EC2_TARGET_GROUP_ARN"]
+          API_KEY_SECRET_ARN = os.environ["API_KEY_SECRET_ARN"]
 
           ec2 = boto3.client("ec2")
           elbv2 = boto3.client("elbv2")
+          sm = boto3.client("secretsmanager")
+
+          def _tokens():
+              # 'apikey' is a comma-separated list of valid tokens. Fetched per
+              # invoke (wake is rare) so newly-added tokens take effect immediately.
+              raw = sm.get_secret_value(SecretId=API_KEY_SECRET_ARN)["SecretString"]
+              return [t.strip() for t in json.loads(raw)["apikey"].split(",") if t.strip()]
+
+          def _authorized(event):
+              """Accept `Authorization: Bearer <token>` (CLI) or HTTP Basic with the
+              token as the password (browser), for any configured token. Header keys
+              arrive lowercased from ALB."""
+              h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+              auth = h.get("authorization", "")
+              tokens = _tokens()
+              if auth.startswith("Bearer "):
+                  return auth[7:] in tokens
+              if auth.startswith("Basic "):
+                  try:
+                      decoded = base64.b64decode(auth[6:]).decode("utf-8", "replace")
+                      return decoded.split(":", 1)[-1] in tokens
+                  except Exception:
+                      return False
+              return False
+
+          def _unauthorized(event):
+              h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+              # Challenge browsers with Basic so they show a native login prompt.
+              hdrs = {"Content-Type": "text/plain"}
+              if "text/html" in h.get("accept", ""):
+                  hdrs["WWW-Authenticate"] = 'Basic realm="flyte"'
+              return {"statusCode": 401, "headers": hdrs, "body": "unauthorized\n"}
 
           _LISTENER_ARN = None
 
@@ -1010,20 +1351,17 @@ Resources:
                       "body": '{"status":"waking","title":"%s"}' % title}
 
           def _flip_to_ec2(wake_tg_arn):
+              # Single-TG forward to ec2-tg (HTTP2). wake_tg_arn is unused now that
+              # we no longer weight between TGs, but kept for signature stability.
               elbv2.modify_listener(
                   ListenerArn=_listener_arn(),
-                  DefaultActions=[{
-                      "Type": "forward",
-                      "ForwardConfig": {
-                          "TargetGroups": [
-                              {"TargetGroupArn": EC2_TG_ARN, "Weight": 1},
-                              {"TargetGroupArn": wake_tg_arn, "Weight": 0},
-                          ],
-                      },
-                  }],
+                  DefaultActions=[{"Type": "forward", "TargetGroupArn": EC2_TG_ARN}],
               )
 
           def lambda_handler(event, _ctx):
+              if not _authorized(event):
+                  log.info("wake rejected: missing/invalid API key")
+                  return _unauthorized(event)
               state = ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]["State"]["Name"]
               wake_tg_arn = event["requestContext"]["elb"]["targetGroupArn"]
               log.info("wake invoked state=%s", state)
@@ -1068,6 +1406,25 @@ Resources:
             Path: /v2
             Query: "#{query}"
             StatusCode: HTTP_302
+
+  # Keeps ec2-tg referenced by the listener (and therefore continuously health-
+  # checked) even while the default action points at the wake lambda. Without a
+  # listener referencing it, ALB stops health-checking the TG and the wake lambda
+  # can't tell when the EC2 is ready to flip back to. The path never matches real
+  # traffic; this rule exists only to hold the reference. Only needed in the wake
+  # configuration (in always-on mode the default action already references ec2-tg).
+  Ec2KeepAliveRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: WantsProdWake
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ["/__ec2-health-keepalive__"] }
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref Ec2TargetGroup
 
   DomainRecord:
     Type: AWS::Route53::RecordSet
@@ -1119,6 +1476,24 @@ Resources:
         GenerateStringKey: password
         ExcludePunctuation: true
         PasswordLength: 32
+
+  # Static API key that gates the UI + gRPC API in Prod (Flyte 2 OSS has no
+  # native auth). Enforced by the on-host Envoy proxy and the wake lambda.
+  # Clients send it as `Authorization: Bearer <apikey>`; browsers via HTTP Basic
+  # (username flyte, password = apikey).
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: IsProd
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "${AWS::StackName}-flyte-apikey"
+      Description: "Comma-separated list of API tokens gating the Flyte UI + gRPC API. Edit 'apikey' to add/rotate (see docs/AUTH.md), then restart flyte-auth-proxy."
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "flyte"}'
+        GenerateStringKey: apikey
+        ExcludePunctuation: true
+        PasswordLength: 40
 
   DbInstance:
     Type: AWS::RDS::DBInstance
@@ -1187,7 +1562,9 @@ Resources:
             Resource: "*"
           - Effect: Allow
             Action: secretsmanager:GetSecretValue
-            Resource: !Ref DbPasswordSecret
+            Resource:
+              - !Ref DbPasswordSecret
+              - !Ref ApiKeySecret
 
 Outputs:
   # ---- Eval mode outputs (Eval+Public) ------------------------------------
@@ -1238,6 +1615,16 @@ Outputs:
     Condition: IsProd
     Description: Endpoint for `flyte create config --endpoint <this>` (Prod mode; TLS by default — drop --insecure).
     Value: !Ref Domain
+
+  ApiKeyRetrieveCli:
+    Condition: IsProd
+    Description: Fetch the API key that gates the UI + gRPC API (browser uses username 'flyte' + this as the password).
+    Value: !Sub "aws secretsmanager get-secret-value --secret-id ${ApiKeySecret} --query SecretString --output text | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"apikey\"])'"
+
+  ClientConfigProd:
+    Condition: IsProd
+    Description: Configure the flyte CLI to send the API key as a bearer token (run ApiKeyRetrieveCli first to get the key, substitute it for <API_KEY>).
+    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type external-command --command 'echo <API_KEY>'"
 
   ProdDbEndpoint:
     Condition: IsProd

@@ -68,7 +68,14 @@ A second listener rule at priority 1 catches path `=/` and 302-redirects to `/v2
 ```
 cloudformation/flyte-devbox.yaml      # the deployable stack (self-contained)
 docs/DEPLOY.md                        # deploy walk-through + sanity checks
+docs/AUTH.md                          # Prod-mode auth: API tokens, client config, rotation
+docs/PROD_WIRING.md                   # external S3/RDS/ECR background
 ```
+
+In **Prod mode** the UI + gRPC API are gated by static API token(s) (Flyte 2 OSS
+has no built-in auth). Clients send a token as a bearer (`FLYTE_TOKEN` env var);
+browsers use HTTP Basic (`flyte` / token). Add/rotate tokens by editing the
+`<stack>-flyte-apikey` Secrets Manager secret. See **docs/AUTH.md**.
 
 The template embeds the EC2 user-data, the idle-polling agent, and both lambdas inline. There is no separate source tree and no build step: edit the YAML, deploy the YAML.
 
@@ -90,9 +97,13 @@ The template creates its own VPC and two public subnets, so there are no network
 
 See `docs/DEPLOY.md` for the post-launch sanity checks.
 
+## Now included (Prod mode)
+
+- **HTTPS via ACM** — 443 listener + DNS-validated ACM cert + Route 53 A record (set `Domain`).
+- **External S3 + RDS** — object store and runs DB wired to the per-stack S3 bucket and RDS Postgres (see `docs/PROD_WIRING.md`).
+- **Auth** — static API token(s) gating the UI + gRPC API (see `docs/AUTH.md`).
+
 ## What's intentionally _not_ here yet
 
 - Packer-built AMI (v1 uses vanilla Ubuntu 24.04 + user-data; once validated, we lift install steps into a Packer build for the marketplace listing)
-- HTTPS via ACM (HTTP-only behind ALB in v1; add a 443 listener + ACM cert as a follow-up)
-- Optional external RDS / external S3 bucket parameters (override surface is documented; CFN params can be added in v1.5)
-- GPU variant of the devbox image (the `flyte-devbox:gpu-*` image works the same; needs a g4dn/g5 instance type and `nvidia-container-toolkit` in user-data)
+- ECR-backed image registry for client builds (stock tasks use the public `ghcr.io/flyteorg/flyte` image; the in-cluster registry handles custom builds)
