@@ -167,9 +167,9 @@ Resources:
 
   # -------------------------------------------------------------------------
   # S3: per-stack object store. Created only in Prod mode (Domain set), where
-  # the marketplace customer is meant to wire Flyte to it via the documented
-  # PROD_WIRING steps. In Eval/Private modes the devbox uses in-cluster
-  # rustfs and the bucket is not created.
+  # the devbox auto-wires Flyte to it at boot (storage.stow override in
+  # user-data). In Eval/Private modes the devbox uses in-cluster rustfs and the
+  # bucket is not created.
   # -------------------------------------------------------------------------
   DataBucket:
     Type: AWS::S3::Bucket
@@ -439,25 +439,21 @@ Resources:
                   DEVBOX_IMAGE=$(echo "$DEVBOX_IMAGE" | sed 's/:latest$/:gpu-latest/')
                 fi
 
-                # No 999-extra-config.yaml override. The devbox runs with chart
-                # defaults: rustfs for object storage, embedded postgres for the
-                # runs DB, in-cluster docker-registry for images. All data lives
-                # on the EBS data volume (mounted at /var/lib/docker), snapshotted
-                # nightly by AWS Backup.
-                #
-                # In Prod mode (Domain set) the stack provisions external S3 /
-                # RDS / ECR resources as a stub; wiring Flyte to use them is a
-                # documented v1.5 step rather than baked into user-data, because
-                # overriding the chart's storage config fights Viper merge
-                # semantics, the k3s addon reconciler, and the SDK's IMDSv1
-                # fallback in ways that were not productive for a v1 demo.
-                # See docs/PROD_WIRING.md.
+                # Storage backends. Eval/Private mode: chart defaults — rustfs for
+                # object storage, embedded postgres for the runs DB, in-cluster
+                # docker-registry for images, all on the EBS data volume
+                # (/var/lib/docker), snapshotted nightly by AWS Backup.
+                # Prod mode (Domain set): the render script below writes a config
+                # override that points Flyte at the external S3 bucket + Aurora
+                # Serverless v2 cluster + ECR this stack provisions (auto-wired at
+                # boot — the override handles Viper merge semantics, the k3s addon
+                # reconciler, and the SDK's IMDS credential fallback).
                 mkdir -p /etc/flyte-devbox
                 : > /etc/flyte-devbox/config.yaml
 
                 # Prod-mode wiring parameters (DB_* / BUCKET_* are "none" outside
-                # Prod). The render script below uses these to point Flyte at
-                # external S3 + RDS in Prod mode. See docs/PROD_WIRING.md.
+                # Prod). The render script below uses these to point Flyte at the
+                # external S3 bucket + Aurora cluster in Prod mode.
                 cat > /etc/flyte-devbox/render.env <<EOF
                 PROD_MODE=${ProdMode}
                 BUCKET_NAME=${BucketName}
@@ -1663,8 +1659,8 @@ Resources:
         EvaluateTargetHealth: false
 
   # =========================================================================
-  # PROD-mode backend stubs — provisioned but NOT auto-wired into the chart.
-  # Customer follows docs/PROD_WIRING.md to point Flyte at these resources.
+  # PROD-mode external backends — provisioned here and auto-wired into the
+  # devbox config at boot (the user-data render script writes the override).
   # =========================================================================
 
   # ---- Postgres (RDS) ----------------------------------------------------
@@ -1936,12 +1932,12 @@ Outputs:
 
   ProdDbEndpoint:
     Condition: IsProd
-    Description: RDS Postgres endpoint for the Flyte runs DB (Prod mode; wire up via PROD_WIRING.md).
+    Description: Aurora Serverless v2 (PostgreSQL) cluster endpoint for the Flyte runs DB (auto-wired in Prod mode).
     Value: !Sub "${DbCluster.Endpoint.Address}:${DbCluster.Endpoint.Port}"
 
   ProdDbSecretArn:
     Condition: IsProd
-    Description: ARN of the Secrets Manager secret holding the RDS master password.
+    Description: ARN of the Secrets Manager secret holding the Aurora master password.
     Value: !Ref DbPasswordSecret
 
   ProdEcrUri:
@@ -1956,7 +1952,7 @@ Outputs:
 
   BucketName:
     Condition: IsProd
-    Description: S3 bucket provisioned for the Prod-mode external backend (wire up via docs/PROD_WIRING.md).
+    Description: S3 bucket auto-wired as the Prod-mode object store.
     Value: !Ref DataBucket
 
   StartCli:

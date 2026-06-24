@@ -1,108 +1,75 @@
 # Auth (Prod mode)
 
-Flyte 2 **OSS has no built-in authentication** on the control plane (UI + gRPC/HTTP
-API). So in Prod mode this stack gates access with one or more **static API
-tokens**, enforced at the edge — there is no per-user identity or RBAC (that's a
-[Union](https://www.union.ai/) feature; this is a single shared-secret gate).
+Prod mode authenticates with **AWS Cognito** (OAuth2): browser SSO, native CLI
+PKCE for humans, and client-credentials (M2M) for CI. No static secrets in client
+config.
+
+> Cognito proves *who you are* — there's no per-user RBAC yet, so every
+> authenticated principal has full control-plane access (RBAC is a
+> [Union](https://www.union.ai/) feature).
+
+## Sign in
+
+**Humans — CLI (PKCE):**
+```bash
+flyte create config --endpoint dns:///flytedemo.app:443 --auth-type pkce
+flyte run --project flytesnacks --domain development hello.py main
+```
+The first call opens a browser for Cognito login, then caches the token. (Endpoint
+is `host:443`, **not** a `/v2` URL; `flyte run` needs `--project`/`--domain`.)
+
+**Browser — UI:** open `https://flytedemo.app/v2` → Cognito login → console.
+
+**CI — M2M (no browser):**
+```bash
+DOMAIN=https://<stack>-<account>.auth.<region>.amazoncognito.com
+TOK=$(curl -s -X POST "$DOMAIN/oauth2/token" \
+  -u "$M2M_CLIENT_ID:$M2M_CLIENT_SECRET" \
+  -d "grant_type=client_credentials&scope=https://flytedemo.app/access" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+```
+Pass it to the CLI via `authType: ExternalCommand`,
+`command: [sh, -c, "echo $FLYTE_TOKEN"]`. `CognitoM2MClientId` is a stack output;
+the secret is on that Cognito client.
+
+## Manage users & sessions
+
+Create a Cognito user (the pool starts empty):
+```bash
+aws cognito-idp admin-create-user --user-pool-id <CognitoUserPoolId> \
+  --username you@example.com \
+  --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true \
+  --temporary-password '<TempPass#1>' --message-action SUPPRESS --region <region>
+```
+Log out (clear cached tokens — there's no `flyte logout`):
+```bash
+python -c "from flyte.remote._client.auth._keyring import KeyringStore; \
+  KeyringStore.delete('dns:///flytedemo.app:443')"
+```
 
 ## How it works
 
-```
-client ──Authorization: Bearer <token>──►  ALB :443 (HTTPS)
-browser ──Authorization: Basic flyte:<token>──►        │
-                                                        ▼
-                                          on-EC2 Envoy proxy :8080
-                                          (Lua checks the token set;
-                                           /healthz + /readyz exempt)
-                                                        │ ok → h2c
-                                                        ▼
-                                              devbox (Flyte) :80
-```
+ALB :443 → on-EC2 **Envoy** → devbox. Envoy runs two filters: `oauth2` (browser
+cookie SSO against Cognito) and `jwt_authn` (validates the Cognito bearer for
+CLI/CI). Unauthenticated **API** calls get a `401` instead of a `302` redirect, so
+the SDK can log in and retry. An on-box **AuthMetadataService sidecar** serves the
+OAuth discovery RPCs that native PKCE needs (the shipped devbox image leaves them
+unimplemented).
 
-- **Envoy** (a container on the EC2) sits between the ALB and Flyte and requires a
-  valid token on every UI **and** gRPC request. `/healthz` + `/readyz` are exempt
-  so the ALB health check passes.
-- The **wake Lambda** (Prod auto-stop mode) enforces the same tokens, so only
-  authenticated callers can wake (and bill) a stopped box.
-- Tokens live in **AWS Secrets Manager**: secret `<stack>-flyte-apikey`, field
-  **`apikey`** — a **comma-separated list** of valid tokens. CloudFormation seeds
-  one random token on first deploy.
+## Auto-stop & wake
 
-## Client config (CLI)
+When idle, the box stops and the ALB routes to the **wake Lambda**, which:
+- logs **browsers** in via Cognito, then starts the box;
+- serves **auth discovery** so the **CLI** can log in while the box is asleep;
+- validates the CLI's bearer before starting the box (~2 min boot — re-run once up).
 
-Flyte 2 OSS can send a static bearer token via the `ExternalCommand` auth type —
-it runs a command and sends the output as `Authorization: Bearer <output>`. The
-cleanest form reads the token from an env var so it isn't stored in the file:
+Set `AutoStop=No` for an always-on box (no wake path).
 
-`~/.flyte/config.yaml`:
-```yaml
-admin:
-  endpoint: dns:///flytedemo.app:443
-  authType: ExternalCommand
-  command: [sh, -c, "echo $FLYTE_TOKEN"]
-task:
-  project: flytesnacks
-  domain: development
-```
-Then:
-```bash
-export FLYTE_TOKEN=<your-token>
-flyte run hello.py main
-```
+## Known gaps
 
-> `authType` in the **config file** must be the canonical value `ExternalCommand`
-> (the friendly `--auth-type custom` alias is only sanitized for the CLI flag).
->
-> Other auth types (`pkce`, `headless`/device-flow, `client-secret`/`app-credential`
-> + `FLYTE_API_KEY`) all require a real OAuth2 authorization server / token
-> endpoint, which OSS Flyte 2 does not provide — use Union for those.
+- `flyte whoami` authenticates but shows `{}` — the OSS devbox doesn't resolve
+  identity from the Cognito token (the token itself is valid).
+- No per-user RBAC. Network access is also gated by `AllowedCidr` on the ALB
+  security group — tighten it to your VPN/office range.
 
-## Browser (UI) access
-
-Open `https://flytedemo.app/v2`. The browser shows a native auth prompt:
-- **Username:** `flyte`
-- **Password:** any valid token
-
-## Retrieve the seeded token
-
-```bash
-aws secretsmanager get-secret-value \
-  --secret-id <stack>-flyte-apikey --region us-east-1 \
-  --query SecretString --output text \
-| python3 -c 'import sys,json;print(json.load(sys.stdin)["apikey"])'
-```
-(Also available as the `ApiKeyRetrieveCli` stack output.)
-
-## Add / rotate tokens (in AWS)
-
-Tokens are the comma-separated `apikey` field. To add or rotate:
-
-1. **Edit the secret** — set `apikey` to a comma-separated list, e.g.
-   `tok-alice,tok-bob,tok-ci`. Tokens should be URL-safe alphanumerics.
-   ```bash
-   aws secretsmanager put-secret-value \
-     --secret-id <stack>-flyte-apikey --region us-east-1 \
-     --secret-string '{"username":"flyte","apikey":"tok-alice,tok-bob,tok-ci"}'
-   ```
-   (Or edit it in the Secrets Manager console: *Retrieve secret value → Edit*.)
-
-2. **Apply it** — the Envoy proxy re-reads the secret on (re)start:
-   ```bash
-   aws ssm start-session --target <instance-id>
-   sudo systemctl restart flyte-auth-proxy
-   ```
-   A stop/start (wake) cycle also re-renders it. The **wake Lambda** picks up
-   changes automatically (it re-reads the secret on each invoke).
-
-3. **Rotate** by removing the old token from the list and restarting the proxy.
-   In-flight clients using the removed token then get `401`.
-
-## Notes
-
-- This is a shared-secret gate, not per-user auth — anyone with a valid token has
-  full control-plane access. For SSO / RBAC / per-user API keys, use Union.
-- **Wake caveat:** if the box has auto-stopped, the first CLI call may fail with
-  `UNAVAILABLE` (the wake Lambda doesn't speak gRPC). Hit `https://flytedemo.app`
-  in a browser to wake it, or rerun the CLI after ~90s. Set `AutoStop=No` to avoid.
-- Network exposure is also gated by `AllowedCidr` on the ALB security group;
-  tighten it to your office/VPN range for defense in depth.
+Stack outputs: `CognitoUserPoolId`, `CognitoM2MClientId`, `ClientConfigProd`.
