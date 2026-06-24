@@ -79,7 +79,7 @@ Parameters:
 
   StableIp:
     Type: String
-    Default: "No"
+    Default: "Yes"
     AllowedValues: ["Yes", "No"]
     Description: |
       When Yes, allocate an Elastic IP so the public hostname survives stop/start cycles
@@ -375,6 +375,9 @@ Resources:
                 DATA_VOLUME_ID="${DataVolumeId}"
                 IDLE_AGENT_PARAM="${IdleAgentParamName}"
                 GPU_SETUP_PARAM="${GpuSetupParamName}"
+                AUTHMETA_PARAM="${AuthMetaParamName}"
+                RENDER_OVERRIDE_PARAM="${RenderOverrideParamName}"
+                AUTHPROXY_PARAM="${AuthProxyParamName}"
 
                 IMDS_TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
                 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
@@ -425,9 +428,8 @@ Resources:
                 fi
 
                 # GPU: if an NVIDIA device is present (PCI vendor 0x10de), install the
-                # driver + container toolkit (from SSM, to keep user-data small),
-                # switch to the gpu image variant, and pass --gpus all to the devbox.
-                # No instance-type list — pure hardware detection. Dormant on CPU nodes.
+                # driver + toolkit (from SSM), use the gpu image, pass --gpus all.
+                # Pure hardware detection (no instance-type list); dormant on CPU.
                 GPU_FLAG=""
                 if grep -qil 10de /sys/bus/pci/devices/*/vendor 2>/dev/null; then
                   echo "NVIDIA GPU detected; enabling GPU mode"
@@ -464,11 +466,44 @@ Resources:
                 DB_NAME=flyte
                 DB_USER=flyte
                 DB_SECRET_ARN=${DbSecretArn}
-                API_KEY_SECRET_ARN=${ApiKeySecretArn}
                 ENVOY_PARAM=${EnvoyParamName}
+                COGNITO_ISSUER=${CognitoIssuer}
+                COGNITO_PKCE_CLIENT_ID=${CognitoPkceClientId}
+                COGNITO_DOMAIN=${CognitoDomain}
+                COGNITO_WEB_CLIENT_ID=${CognitoWebClientId}
+                COGNITO_POOL_ID=${CognitoPoolId}
                 RENDER_REGION=${AwsRegion}
                 EOF
                 chmod 0600 /etc/flyte-devbox/render.env
+
+                # AuthMetadataService sidecar: serves the Cognito discovery RPCs the
+                # devbox image leaves UNIMPLEMENTED, so native `flyte --auth-type pkce`
+                # works. Envoy routes /flyteidl2.auth.AuthMetadataService/* to it.
+                cat > /etc/flyte-devbox/authmeta.env <<EOF
+                ISSUER=${CognitoIssuer}
+                DOMAIN=https://${CognitoDomain}
+                CLIENT=${CognitoPkceClientId}
+                EOF
+                chmod 0600 /etc/flyte-devbox/authmeta.env
+                mkdir -p /opt/flyte-authmeta
+                aws ssm get-parameter --name "$AUTHMETA_PARAM" --region "$AWS_REGION" \
+                  --query Parameter.Value --output text > /opt/flyte-authmeta/sidecar.py
+                cat > /etc/systemd/system/flyte-authmeta.service <<'AMUNIT_EOF'
+                [Unit]
+                Description=Flyte AuthMetadataService sidecar (Cognito discovery for CLI PKCE)
+                After=network-online.target
+                Wants=network-online.target
+
+                [Service]
+                Type=simple
+                Restart=on-failure
+                RestartSec=10
+                EnvironmentFile=/etc/flyte-devbox/authmeta.env
+                ExecStart=/opt/flyte-idle-agent/venv/bin/python /opt/flyte-authmeta/sidecar.py
+
+                [Install]
+                WantedBy=multi-user.target
+                AMUNIT_EOF
 
                 # Helper: render /var/lib/flyte/config/config.yaml (the devbox's
                 # 999-extra-config override, loaded last so it wins) on every boot.
@@ -479,79 +514,8 @@ Resources:
                 #     postgresql.flyte) but are unused.
                 #   - Eval mode: just point signedURL at the EC2 public hostname so
                 #     remote `flyte run` uploads bundles to the rustfs NodePort.
-                cat > /usr/local/bin/flyte-render-override.sh <<'HELPER_EOF'
-                #!/bin/bash
-                set -euo pipefail
-                source /etc/flyte-devbox/render.env
-
-                if [ "$PROD_MODE" = "1" ]; then
-                  PW=$(aws secretsmanager get-secret-value \
-                         --secret-id "$DB_SECRET_ARN" --region "$RENDER_REGION" \
-                         --query SecretString --output text \
-                       | python3 -c 'import sys,json; print(json.load(sys.stdin)["password"])')
-                  cat > /etc/flyte-devbox/config.yaml <<EOF
-                runs:
-                  storagePrefix: s3://$BUCKET_NAME
-                  database:
-                    postgres:
-                      host: $DB_HOST
-                      port: $DB_PORT
-                      dbName: $DB_NAME
-                      user: $DB_USER
-                      username: $DB_USER
-                      password: "$PW"
-                      options: sslmode=require
-                storage:
-                  type: stow
-                  stow:
-                    kind: s3
-                    config:
-                      region: $RENDER_REGION
-                      auth_type: iam
-                      endpoint: ""
-                      disable_ssl: false
-                      v2_signing: false
-                      access_key_id: ""
-                      secret_key: ""
-                  container: $BUCKET_NAME
-                  signedURL:
-                    stowConfigOverride:
-                      endpoint: ""
-                plugins:
-                  k8s:
-                    default-env-vars:
-                    - AWS_REGION: $RENDER_REGION
-                    - AWS_DEFAULT_REGION: $RENDER_REGION
-                    - _U_EP_OVERRIDE: flyte-binary-http.flyte:8090
-                    - _U_INSECURE: "true"
-                    - _U_USE_ACTIONS: "1"
-                internalApps:
-                  defaultEnvVars:
-                  - AWS_REGION: $RENDER_REGION
-                  - AWS_DEFAULT_REGION: $RENDER_REGION
-                  - _U_EP_OVERRIDE: flyte-binary-http.flyte:8090
-                  - _U_INSECURE: "true"
-                  - _U_USE_ACTIONS: "1"
-                EOF
-                  echo "rendered Prod override (S3=$BUCKET_NAME RDS=$DB_HOST)"
-                  exit 0
-                fi
-
-                # Eval mode: point signed URLs at the current public hostname.
-                TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-                HOST=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-hostname)
-                if [ -z "$HOST" ]; then
-                  echo "no public hostname; leaving override empty (UI/local-only)"
-                  : > /etc/flyte-devbox/config.yaml
-                  exit 0
-                fi
-                cat > /etc/flyte-devbox/config.yaml <<EOF
-                storage:
-                  signedURL:
-                    stowConfigOverride:
-                      endpoint: http://$HOST:30002
-                EOF
-                HELPER_EOF
+                aws ssm get-parameter --name "$RENDER_OVERRIDE_PARAM" --region "$AWS_REGION" \
+                  --query Parameter.Value --output text > /usr/local/bin/flyte-render-override.sh
                 chmod 0755 /usr/local/bin/flyte-render-override.sh
 
                 # Auth proxy (Prod only): an on-EC2 Envoy that sits between the ALB
@@ -563,28 +527,8 @@ Resources:
                 # /healthz + /readyz are exempt so ALB health checks pass. Flyte 2
                 # OSS has no native auth; this is the gate. Add/rotate tokens by
                 # editing the secret (see docs/AUTH.md) and restarting this service.
-                cat > /usr/local/bin/flyte-render-authproxy.sh <<'AUTHPROXY_EOF'
-                #!/bin/bash
-                set -euo pipefail
-                source /etc/flyte-devbox/render.env
-                if [ "$PROD_MODE" != "1" ]; then
-                  exit 0
-                fi
-                APIKEYS=$(aws secretsmanager get-secret-value \
-                            --secret-id "$API_KEY_SECRET_ARN" --region "$RENDER_REGION" \
-                            --query SecretString --output text \
-                          | python3 -c 'import sys,json; print(json.load(sys.stdin)["apikey"])')
-                ENTRIES=""
-                for t in $(echo "$APIKEYS" | tr ',' ' '); do
-                  b=$(printf 'flyte:%s' "$t" | base64 | tr -d '\n')
-                  ENTRIES="$ENTRIES['Bearer $t']=true,['Basic $b']=true,"
-                done
-                aws ssm get-parameter --name "$ENVOY_PARAM" --region "$RENDER_REGION" \
-                  --query Parameter.Value --output text > /etc/flyte-devbox/envoy.yaml
-                sed -i "s|__OKENTRIES__|$ENTRIES|g" /etc/flyte-devbox/envoy.yaml
-                chmod 0600 /etc/flyte-devbox/envoy.yaml
-                echo "rendered Envoy auth-proxy config"
-                AUTHPROXY_EOF
+                aws ssm get-parameter --name "$AUTHPROXY_PARAM" --region "$AWS_REGION" \
+                  --query Parameter.Value --output text > /usr/local/bin/flyte-render-authproxy.sh
                 chmod 0755 /usr/local/bin/flyte-render-authproxy.sh
 
                 cat > /etc/systemd/system/flyte-auth-proxy.service <<'PROXYUNIT_EOF'
@@ -700,9 +644,12 @@ Resources:
                   sleep 5
                 done
 
-                # Prod only: start the Envoy auth proxy (ALB -> :8080 -> devbox:80,
-                # static API key required). Pre-pull so the systemd start is fast.
+                # Prod only: start the AuthMetadataService sidecar (Cognito discovery
+                # for CLI PKCE) then the Envoy auth proxy (ALB -> :8080 -> devbox:80,
+                # Cognito JWT/oauth2). Pre-pull envoy so the systemd start is fast.
                 if [ "${ProdMode}" = "1" ]; then
+                  systemctl enable flyte-authmeta.service
+                  systemctl start flyte-authmeta.service
                   docker pull envoyproxy/envoy:v1.34-latest || true
                   systemctl enable flyte-auth-proxy.service
                   systemctl start flyte-auth-proxy.service
@@ -717,14 +664,21 @@ Resources:
                 DataDevice: /dev/nvme1n1
                 ProdMode: !If [IsProd, "1", "0"]
                 BucketName: !If [IsProd, !Ref DataBucket, "none"]
-                DbHost: !If [IsProd, !GetAtt DbInstance.Endpoint.Address, "none"]
-                DbPort: !If [IsProd, !GetAtt DbInstance.Endpoint.Port, "5432"]
+                DbHost: !If [IsProd, !GetAtt DbCluster.Endpoint.Address, "none"]
+                DbPort: !If [IsProd, !GetAtt DbCluster.Endpoint.Port, "5432"]
                 DbSecretArn: !If [IsProd, !Ref DbPasswordSecret, "none"]
-                ApiKeySecretArn: !If [IsProd, !Ref ApiKeySecret, "none"]
                 IdleAgentParamName: !Ref IdleAgentScriptParam
                 EnvoyParamName: !If [IsProd, !Ref EnvoyConfigParam, "none"]
+                CognitoIssuer: !If [IsProd, !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}", "none"]
+                CognitoPkceClientId: !If [IsProd, !Ref UserPoolClientPkce, "none"]
+                CognitoDomain: !If [IsProd, !Sub "${AWS::StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com", "none"]
+                CognitoWebClientId: !If [IsProd, !Ref UserPoolClientWeb, "none"]
+                CognitoPoolId: !If [IsProd, !Ref UserPool, "none"]
                 DataVolumeId: !Ref DataVolume
                 GpuSetupParamName: !Ref GpuSetupScriptParam
+                RenderOverrideParamName: !Ref RenderOverrideScriptParam
+                AuthProxyParamName: !Ref AuthProxyScriptParam
+                AuthMetaParamName: !If [IsProd, !Ref AuthMetaSidecarParam, "none"]
 
   # ------------------------------------------------------------------------
   # Large boot assets stored as SSM Parameters (not in EC2 user-data, which
@@ -733,6 +687,150 @@ Resources:
   # NVIDIA driver + container toolkit installer, fetched + run by user-data only
   # when an NVIDIA GPU is detected. Configures the docker nvidia runtime so
   # `docker run --gpus all` (the devbox GPU mode) works.
+  RenderOverrideScriptParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/flyte/render-override.sh"
+      Type: String
+      Tier: Standard
+      Value: |
+        #!/bin/bash
+        set -euo pipefail
+        source /etc/flyte-devbox/render.env
+
+        if [ "$PROD_MODE" = "1" ]; then
+          PW=$(aws secretsmanager get-secret-value \
+                 --secret-id "$DB_SECRET_ARN" --region "$RENDER_REGION" \
+                 --query SecretString --output text \
+               | python3 -c 'import sys,json; print(json.load(sys.stdin)["password"])')
+          cat > /etc/flyte-devbox/config.yaml <<EOF
+        runs:
+          storagePrefix: s3://$BUCKET_NAME
+          database:
+            postgres:
+              host: $DB_HOST
+              port: $DB_PORT
+              dbName: $DB_NAME
+              user: $DB_USER
+              username: $DB_USER
+              password: "$PW"
+              options: sslmode=require
+          authMetadata:
+            externalAuthServerBaseUrl: $COGNITO_ISSUER
+            externalMetadataUrl: .well-known/openid-configuration
+            flyteClient:
+              clientId: $COGNITO_PKCE_CLIENT_ID
+              redirectUri: http://localhost:8089/callback
+              scopes:
+              - openid
+              - profile
+        storage:
+          type: stow
+          stow:
+            kind: s3
+            config:
+              region: $RENDER_REGION
+              auth_type: iam
+              endpoint: ""
+              disable_ssl: false
+              v2_signing: false
+              access_key_id: ""
+              secret_key: ""
+          container: $BUCKET_NAME
+          signedURL:
+            stowConfigOverride:
+              endpoint: ""
+        plugins:
+          k8s:
+            default-env-vars:
+            - AWS_REGION: $RENDER_REGION
+            - AWS_DEFAULT_REGION: $RENDER_REGION
+            - _U_EP_OVERRIDE: flyte-binary-http.flyte:8090
+            - _U_INSECURE: "true"
+            - _U_USE_ACTIONS: "1"
+        internalApps:
+          defaultEnvVars:
+          - AWS_REGION: $RENDER_REGION
+          - AWS_DEFAULT_REGION: $RENDER_REGION
+          - _U_EP_OVERRIDE: flyte-binary-http.flyte:8090
+          - _U_INSECURE: "true"
+          - _U_USE_ACTIONS: "1"
+        EOF
+          echo "rendered Prod override (S3=$BUCKET_NAME RDS=$DB_HOST)"
+          exit 0
+        fi
+
+        # Eval mode: point signed URLs at the current public hostname.
+        TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+        HOST=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-hostname)
+        if [ -z "$HOST" ]; then
+          echo "no public hostname; leaving override empty (UI/local-only)"
+          : > /etc/flyte-devbox/config.yaml
+          exit 0
+        fi
+        cat > /etc/flyte-devbox/config.yaml <<EOF
+        storage:
+          signedURL:
+            stowConfigOverride:
+              endpoint: http://$HOST:30002
+        EOF
+
+  AuthProxyScriptParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/flyte/render-authproxy.sh"
+      Type: String
+      Tier: Standard
+      Value: |
+        #!/bin/bash
+        set -euo pipefail
+        source /etc/flyte-devbox/render.env
+        if [ "$PROD_MODE" != "1" ]; then
+          exit 0
+        fi
+        # Confidential client secret (for the Envoy oauth2 browser flow) fetched at
+        # boot so it is never stored in the template/user-data.
+        SECRET=$(aws cognito-idp describe-user-pool-client --user-pool-id "$COGNITO_POOL_ID" \
+          --client-id "$COGNITO_WEB_CLIENT_ID" --region "$RENDER_REGION" \
+          --query "UserPoolClient.ClientSecret" --output text)
+        # Persistent HMAC for oauth2 cookie signing (survives restarts so sessions persist).
+        if [ ! -s /etc/flyte-devbox/oauth-hmac ]; then openssl rand -base64 32 | tr -d "\n" > /etc/flyte-devbox/oauth-hmac; fi
+        HMAC=$(cat /etc/flyte-devbox/oauth-hmac)
+        aws ssm get-parameter --name "$ENVOY_PARAM" --region "$RENDER_REGION" \
+          --query Parameter.Value --output text > /etc/flyte-devbox/envoy.yaml
+        sed -i "s|__ISSUER__|$COGNITO_ISSUER|g; s|__DOMAIN__|$COGNITO_DOMAIN|g; s|__WEB_CLIENT_ID__|$COGNITO_WEB_CLIENT_ID|g; s|__CLIENT_SECRET__|$SECRET|g; s|__HMAC__|$HMAC|g" /etc/flyte-devbox/envoy.yaml
+        chmod 0600 /etc/flyte-devbox/envoy.yaml
+        echo "rendered Envoy auth-proxy (oauth2 browser + jwt CLI) config"
+  AuthMetaSidecarParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/flyte/authmeta-sidecar.py"
+      Type: String
+      Tier: Standard
+      Value: |
+        import http.server, os
+        from flyteidl2.auth.auth_service_pb2 import GetOAuth2MetadataResponse, GetPublicClientConfigResponse
+        ISSUER=os.environ["ISSUER"]; DOMAIN=os.environ["DOMAIN"]; CLIENT=os.environ["CLIENT"]
+        def meta():
+            m=GetOAuth2MetadataResponse(issuer=ISSUER, authorization_endpoint=DOMAIN+"/oauth2/authorize",
+                token_endpoint=DOMAIN+"/oauth2/token", jwks_uri=ISSUER+"/.well-known/jwks.json")
+            m.response_types_supported.append("code"); m.scopes_supported.extend(["openid","profile"])
+            m.code_challenge_methods_supported.append("S256")
+            m.grant_types_supported.extend(["authorization_code","refresh_token"])
+            return m
+        def pcc():
+            return GetPublicClientConfigResponse(client_id=CLIENT, redirect_uri="http://localhost:8089/callback",
+                scopes=["openid","profile"], authorization_metadata_key="authorization")
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n=int(self.headers.get("content-length",0)); self.rfile.read(n)
+                if self.path.endswith("GetOAuth2Metadata"): b=meta().SerializeToString()
+                elif self.path.endswith("GetPublicClientConfig"): b=pcc().SerializeToString()
+                else: self.send_response(404); self.end_headers(); return
+                self.send_response(200); self.send_header("content-type","application/proto"); self.send_header("content-length",str(len(b))); self.end_headers(); self.wfile.write(b)
+            def log_message(self,*a): pass
+        http.server.HTTPServer(("127.0.0.1",9099),H).serve_forever()
+
   GpuSetupScriptParam:
     Type: AWS::SSM::Parameter
     Properties:
@@ -851,17 +949,19 @@ Resources:
     Properties:
       Name: !Sub "/${AWS::StackName}/flyte/envoy.yaml"
       Type: String
-      Tier: Standard
+      Tier: Advanced
       Description: Envoy auth-proxy config template (__APIKEY__/__BASIC__ substituted at boot).
       Value: |
-        admin:
-          address:
-            socket_address: { address: 127.0.0.1, port_value: 9901 }
+        admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
         static_resources:
+          secrets:
+          - name: token_secret
+            generic_secret: { secret: { inline_string: "__CLIENT_SECRET__" } }
+          - name: hmac_secret
+            generic_secret: { secret: { inline_string: "__HMAC__" } }
           listeners:
           - name: ingress
-            address:
-              socket_address: { address: 0.0.0.0, port_value: 8080 }
+            address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
             filter_chains:
             - filters:
               - name: envoy.filters.network.http_connection_manager
@@ -876,44 +976,100 @@ Resources:
                     - name: all
                       domains: ["*"]
                       routes:
+                      - match: { prefix: "/flyteidl2.auth.AuthMetadataService" }
+                        route: { cluster: authmeta, timeout: 0s }
                       - match: { prefix: "/" }
                         route: { cluster: devbox, timeout: 0s }
                   http_filters:
-                  - name: envoy.filters.http.lua
+                  - name: envoy.filters.http.oauth2
                     typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
-                      default_source_code:
-                        inline_string: |
-                          -- Valid credentials are rendered in at boot from the API-key
-                          -- secret (one Bearer + one Basic entry per token).
-                          local ok = {__OKENTRIES__}
-                          function envoy_on_request(handle)
-                            local p = handle:headers():get(":path") or ""
-                            if p == "/healthz" or p == "/readyz" then return end
-                            local a = handle:headers():get("authorization") or ""
-                            if ok[a] then return end
-                            handle:respond({[":status"] = "401", ["www-authenticate"] = "Basic realm=\"flyte\"", ["content-type"] = "text/plain"}, "unauthorized\n")
-                          end
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
+                      config:
+                        token_endpoint: { cluster: cognito_oauth, uri: "https://__DOMAIN__/oauth2/token", timeout: 5s }
+                        authorization_endpoint: "https://__DOMAIN__/oauth2/authorize"
+                        redirect_uri: "https://%REQ(:authority)%/oauth2/callback"
+                        redirect_path_matcher: { path: { exact: "/oauth2/callback" } }
+                        signout_path: { path: { exact: "/oauth2/signout" } }
+                        forward_bearer_token: true
+                        use_refresh_token: true
+                        auth_type: BASIC_AUTH
+                        auth_scopes: [openid, profile]
+                        credentials:
+                          client_id: "__WEB_CLIENT_ID__"
+                          token_secret: { name: token_secret }
+                          hmac_secret: { name: hmac_secret }
+                        pass_through_matcher:
+                        - name: ":path"
+                          string_match: { prefix: "/healthz" }
+                        - name: ":path"
+                          string_match: { prefix: "/readyz" }
+                        - name: ":path"
+                          string_match: { prefix: "/.well-known/" }
+                        - name: ":path"
+                          string_match: { prefix: "/flyteidl2.auth.AuthMetadataService" }
+                        - name: "authorization"
+                          present_match: true
+                        # API/gRPC requests still flow THROUGH oauth2 so the browser UI's
+                        # cookie session is validated + a bearer injected for the backend.
+                        # But for unauthenticated API calls (no cookie), return 401 instead
+                        # of a 302 HTML redirect — the CLI/SDK needs a clean 401, and the
+                        # browser SPA can handle 401 without a CORS-breaking redirect.
+                        deny_redirect_matcher:
+                        - name: "content-type"
+                          string_match: { prefix: "application/grpc" }
+                        - name: "content-type"
+                          string_match: { prefix: "application/proto" }
+                        - name: "content-type"
+                          string_match: { prefix: "application/connect" }
+                  - name: envoy.filters.http.jwt_authn
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                      providers:
+                        cognito:
+                          issuer: "__ISSUER__"
+                          forward: true
+                          remote_jwks:
+                            http_uri: { uri: "__ISSUER__/.well-known/jwks.json", cluster: cognito_jwks, timeout: 5s }
+                            cache_duration: 600s
+                      rules:
+                      - match: { prefix: "/healthz" }
+                      - match: { prefix: "/readyz" }
+                      - match: { prefix: "/.well-known/" }
+                      - match: { prefix: "/oauth2/" }
+                      - match: { prefix: "/flyteidl2.auth.AuthMetadataService" }
+                      - match: { prefix: "/" }
+                        requires: { provider_name: cognito }
                   - name: envoy.filters.http.router
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                    typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
           clusters:
           - name: devbox
             connect_timeout: 5s
             type: STATIC
-            lb_policy: ROUND_ROBIN
             typed_extension_protocol_options:
               envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
                 "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-                explicit_http_config:
-                  http2_protocol_options: {}
-            load_assignment:
-              cluster_name: devbox
-              endpoints:
-              - lb_endpoints:
-                - endpoint:
-                    address:
-                      socket_address: { address: 127.0.0.1, port_value: 80 }
+                explicit_http_config: { http2_protocol_options: {} }
+            load_assignment: { cluster_name: devbox, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 80 } } } } ] } ] }
+          - name: authmeta
+            connect_timeout: 5s
+            type: STATIC
+            load_assignment: { cluster_name: authmeta, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 9099 } } } } ] } ] }
+          - name: cognito_jwks
+            connect_timeout: 5s
+            type: LOGICAL_DNS
+            dns_lookup_family: V4_ONLY
+            load_assignment: { cluster_name: cognito_jwks, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: cognito-idp.us-east-1.amazonaws.com, port_value: 443 } } } } ] } ] }
+            transport_socket:
+              name: envoy.transport_sockets.tls
+              typed_config: { "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext, sni: cognito-idp.us-east-1.amazonaws.com }
+          - name: cognito_oauth
+            connect_timeout: 5s
+            type: LOGICAL_DNS
+            dns_lookup_family: V4_ONLY
+            load_assignment: { cluster_name: cognito_oauth, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: __DOMAIN__, port_value: 443 } } } } ] } ] }
+            transport_socket:
+              name: envoy.transport_sockets.tls
+              typed_config: { "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext, sni: __DOMAIN__ }
   Instance:
     Type: AWS::EC2::Instance
     Properties:
@@ -1236,9 +1392,11 @@ Resources:
                   - elasticloadbalancing:DescribeListeners
                   - elasticloadbalancing:ModifyListener
                 Resource: "*"
+              # Read the confidential web client secret to exchange the browser
+              # login's authorization code (Cognito SSO -> wake).
               - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref ApiKeySecret
+                Action: cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt UserPool.Arn
 
   WakeLambda:
     Type: AWS::Lambda::Function
@@ -1253,16 +1411,19 @@ Resources:
           INSTANCE_ID: !Ref Instance
           LOAD_BALANCER_ARN: !Ref LoadBalancer
           EC2_TARGET_GROUP_ARN: !Ref Ec2TargetGroup
-          API_KEY_SECRET_ARN: !Ref ApiKeySecret
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+          COGNITO_DOMAIN: !Sub "https://${AWS::StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+          COGNITO_WEB_CLIENT_ID: !Ref UserPoolClientWeb
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_PKCE_CLIENT_ID: !Ref UserPoolClientPkce
       Code:
         ZipFile: |
-          """Prod-mode wake handler. ALB targets this lambda while the EC2 is
-          stopped. On invoke: first require the static API key (same key the
-          on-host Envoy enforces) so only authenticated callers can wake (and
-          bill) the box; then start the EC2 if stopped; once ec2-tg has a healthy
-          target, flip the listener so the next request hits the EC2 directly.
-          Until then, return a 'starting...' page that auto-refreshes."""
-          import base64, json, logging, os
+          """Prod-mode wake handler. ALB targets this lambda while the EC2 is stopped.
+          Auth: the CLI sends a Cognito Bearer JWT (validated here); browsers are sent to
+          Cognito login and authenticated via the /oauth2/callback code exchange. Once
+          authenticated, start the EC2; when ec2-tg is healthy, flip the listener so the
+          next request hits the box (Envoy) directly. Until then a 'starting' page polls."""
+          import base64, hashlib, json, logging, os, time, urllib.parse, urllib.request
           import boto3
 
           log = logging.getLogger(); log.setLevel(logging.INFO)
@@ -1270,74 +1431,118 @@ Resources:
           INSTANCE_ID = os.environ["INSTANCE_ID"]
           LOAD_BALANCER_ARN = os.environ["LOAD_BALANCER_ARN"]
           EC2_TG_ARN = os.environ["EC2_TARGET_GROUP_ARN"]
-          API_KEY_SECRET_ARN = os.environ["API_KEY_SECRET_ARN"]
+          COGNITO_ISSUER = os.environ["COGNITO_ISSUER"]
+          COGNITO_DOMAIN = os.environ["COGNITO_DOMAIN"]
+          WEB_CLIENT_ID = os.environ["COGNITO_WEB_CLIENT_ID"]
+          POOL_ID = os.environ["COGNITO_POOL_ID"]
+          PKCE_CLIENT_ID = os.environ["COGNITO_PKCE_CLIENT_ID"]
 
           ec2 = boto3.client("ec2")
           elbv2 = boto3.client("elbv2")
-          sm = boto3.client("secretsmanager")
+          idp = boto3.client("cognito-idp")
 
-          def _tokens():
-              # 'apikey' is a comma-separated list of valid tokens. Fetched per
-              # invoke (wake is rare) so newly-added tokens take effect immediately.
-              raw = sm.get_secret_value(SecretId=API_KEY_SECRET_ARN)["SecretString"]
-              return [t.strip() for t in json.loads(raw)["apikey"].split(",") if t.strip()]
+          # --- AuthMetadataService discovery, served here so the CLI can discover
+          # Cognito + log in while the box is ASLEEP (the on-box sidecar is
+          # unreachable then). Hand-encoded protobuf (stdlib only) to byte-match
+          # the sidecar's GetOAuth2Metadata / GetPublicClientConfig responses. ---
+          def _vw(n):
+              o = bytearray()
+              while True:
+                  b = n & 0x7f; n >>= 7
+                  o.append(b | (0x80 if n else 0))
+                  if not n:
+                      return bytes(o)
 
-          def _authorized(event):
-              """Accept `Authorization: Bearer <token>` (CLI) or HTTP Basic with the
-              token as the password (browser), for any configured token. Header keys
-              arrive lowercased from ALB."""
-              h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
-              auth = h.get("authorization", "")
-              tokens = _tokens()
-              if auth.startswith("Bearer "):
-                  return auth[7:] in tokens
-              if auth.startswith("Basic "):
-                  try:
-                      decoded = base64.b64decode(auth[6:]).decode("utf-8", "replace")
-                      return decoded.split(":", 1)[-1] in tokens
-                  except Exception:
+          def _pf(num, s):
+              d = s.encode()
+              return _vw((num << 3) | 2) + _vw(len(d)) + d
+
+          def _meta():
+              return (_pf(1, COGNITO_ISSUER) + _pf(2, COGNITO_DOMAIN + "/oauth2/authorize")
+                  + _pf(3, COGNITO_DOMAIN + "/oauth2/token") + _pf(4, "code")
+                  + _pf(5, "openid") + _pf(5, "profile")
+                  + _pf(7, COGNITO_ISSUER + "/.well-known/jwks.json") + _pf(8, "S256")
+                  + _pf(9, "authorization_code") + _pf(9, "refresh_token"))
+
+          def _pcc():
+              return (_pf(1, PKCE_CLIENT_ID) + _pf(2, "http://localhost:8089/callback")
+                  + _pf(3, "openid") + _pf(3, "profile") + _pf(4, "authorization"))
+
+          def _proto(b):
+              return {"statusCode": 200, "headers": {"Content-Type": "application/proto"},
+                  "body": base64.b64encode(b).decode(), "isBase64Encoded": True}
+
+          _JWKS = None
+          def _jwks(refresh=False):
+              global _JWKS
+              if _JWKS is None or refresh:
+                  with urllib.request.urlopen(COGNITO_ISSUER + "/.well-known/jwks.json", timeout=5) as r:
+                      _JWKS = {k["kid"]: k for k in json.load(r)["keys"]}
+              return _JWKS
+
+          def _b64u(s):
+              return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+          def _valid_jwt(token):
+              try:
+                  hb, pb, sb = token.split(".")
+                  hdr = json.loads(_b64u(hb)); pl = json.loads(_b64u(pb))
+                  if pl.get("iss") != COGNITO_ISSUER or pl.get("exp", 0) < time.time():
                       return False
-              return False
+                  key = _jwks().get(hdr.get("kid")) or _jwks(refresh=True).get(hdr.get("kid"))
+                  if not key:
+                      return False
+                  n = int.from_bytes(_b64u(key["n"]), "big"); e = int.from_bytes(_b64u(key["e"]), "big")
+                  sig = int.from_bytes(_b64u(sb), "big")
+                  k = (n.bit_length() + 7) // 8
+                  em = pow(sig, e, n).to_bytes(k, "big")
+                  der = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256((hb + "." + pb).encode()).digest()
+                  return em == b"\x00\x01" + b"\xff" * (k - len(der) - 3) + b"\x00" + der
+              except Exception:
+                  log.exception("jwt validation error"); return False
 
-          def _unauthorized(event):
-              h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
-              # Challenge browsers with Basic so they show a native login prompt.
-              hdrs = {"Content-Type": "text/plain"}
-              if "text/html" in h.get("accept", ""):
-                  hdrs["WWW-Authenticate"] = 'Basic realm="flyte"'
-              return {"statusCode": 401, "headers": hdrs, "body": "unauthorized\n"}
+          _SECRET = None
+          def _web_secret():
+              global _SECRET
+              if _SECRET is None:
+                  _SECRET = idp.describe_user_pool_client(UserPoolId=POOL_ID, ClientId=WEB_CLIENT_ID)["UserPoolClient"]["ClientSecret"]
+              return _SECRET
+
+          def _exchange_code(code, redirect_uri):
+              # Authorization-code exchange with the confidential web client. HTTP 200 ==
+              # the browser user authenticated with Cognito, so they may wake the box.
+              try:
+                  data = urllib.parse.urlencode({"grant_type": "authorization_code", "client_id": WEB_CLIENT_ID,
+                      "code": code, "redirect_uri": redirect_uri}).encode()
+                  basic = base64.b64encode(("%s:%s" % (WEB_CLIENT_ID, _web_secret())).encode()).decode()
+                  req = urllib.request.Request(COGNITO_DOMAIN + "/oauth2/token", data=data,
+                      headers={"Content-Type": "application/x-www-form-urlencoded", "Authorization": "Basic " + basic})
+                  with urllib.request.urlopen(req, timeout=8) as r:
+                      return r.status == 200
+              except Exception:
+                  log.exception("code exchange failed"); return False
 
           _LISTENER_ARN = None
-
           def _listener_arn():
               global _LISTENER_ARN
               if _LISTENER_ARN is None:
-                  resp = elbv2.describe_listeners(LoadBalancerArn=LOAD_BALANCER_ARN)
-                  for lst in resp["Listeners"]:
+                  for lst in elbv2.describe_listeners(LoadBalancerArn=LOAD_BALANCER_ARN)["Listeners"]:
                       if lst["Port"] == 443:
                           _LISTENER_ARN = lst["ListenerArn"]; break
               return _LISTENER_ARN
 
-          PAGE = """<!doctype html>
-          <html><head>
-          <meta charset="utf-8">
-          <meta http-equiv="refresh" content="20">
-          <title>Starting Flyte devbox…</title>
-          <style>
-          body{font-family:-apple-system,system-ui,sans-serif;background:#0f1115;color:#d8dee9;
-               display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+          PAGE = """<!doctype html><html><head><meta charset="utf-8">
+          <meta http-equiv="refresh" content="15; url=/v2">
+          <title>Starting Flyte devbox</title><style>
+          body{font-family:-apple-system,system-ui,sans-serif;background:#0f1115;color:#d8dee9;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
           .box{text-align:center;max-width:520px;padding:24px}
-          .spinner{width:48px;height:48px;border:4px solid #3b4252;border-top-color:#88c0d0;
-                   border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 24px}
+          .spinner{width:48px;height:48px;border:4px solid #3b4252;border-top-color:#88c0d0;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 24px}
           @keyframes spin{to{transform:rotate(360deg)}}
           .detail{color:#6c7382;font-size:0.9em;margin-top:16px}
-          </style></head><body><div class="box">
-          <div class="spinner"></div>
-          <h2>__TITLE__</h2>
-          <p class="detail">__DETAIL__</p>
-          <p class="detail">This page auto-refreshes every 20 seconds.</p>
-          </div></body></html>
-          """
+          </style></head><body><div class="box"><div class="spinner"></div>
+          <h2>__TITLE__</h2><p class="detail">__DETAIL__</p>
+          <p class="detail">Signed in - returning to the app automatically.</p>
+          </div></body></html>"""
 
           def _wants_html(event):
               h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
@@ -1350,22 +1555,19 @@ Resources:
               return {"statusCode": 503, "headers": {"Content-Type": "application/json", "Retry-After": "20"},
                       "body": '{"status":"waking","title":"%s"}' % title}
 
-          def _flip_to_ec2(wake_tg_arn):
-              # Single-TG forward to ec2-tg (HTTP2). wake_tg_arn is unused now that
-              # we no longer weight between TGs, but kept for signature stability.
-              elbv2.modify_listener(
-                  ListenerArn=_listener_arn(),
-                  DefaultActions=[{"Type": "forward", "TargetGroupArn": EC2_TG_ARN}],
-              )
+          def _flip_to_ec2():
+              elbv2.modify_listener(ListenerArn=_listener_arn(),
+                  DefaultActions=[{"Type": "forward", "TargetGroupArn": EC2_TG_ARN}])
 
-          def lambda_handler(event, _ctx):
-              if not _authorized(event):
-                  log.info("wake rejected: missing/invalid API key")
-                  return _unauthorized(event)
+          def _login_redirect(redirect_uri):
+              url = (COGNITO_DOMAIN + "/oauth2/authorize?response_type=code&client_id=" + WEB_CLIENT_ID +
+                     "&scope=" + urllib.parse.quote("openid profile") +
+                     "&redirect_uri=" + urllib.parse.quote(redirect_uri, safe=""))
+              return {"statusCode": 302, "headers": {"Location": url, "Cache-Control": "no-store"}, "body": ""}
+
+          def _wake(event):
               state = ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]["State"]["Name"]
-              wake_tg_arn = event["requestContext"]["elb"]["targetGroupArn"]
               log.info("wake invoked state=%s", state)
-
               if state == "stopped":
                   ec2.start_instances(InstanceIds=[INSTANCE_ID])
                   return _response(event, 200, "Starting your Flyte devbox", "EC2 boot + Docker + k3s startup takes about 2 minutes.")
@@ -1375,11 +1577,33 @@ Resources:
                   resp = elbv2.describe_target_health(TargetGroupArn=EC2_TG_ARN)
                   healthy = any(d["TargetHealth"]["State"] == "healthy" for d in resp["TargetHealthDescriptions"])
                   if healthy:
-                      _flip_to_ec2(wake_tg_arn)
-                      return _response(event, 200, "Ready", "Refresh to continue.")
-                  return _response(event, 200, "Devbox is starting", "Flyte services coming up — give it another moment.")
+                      _flip_to_ec2()
+                      return _response(event, 200, "Ready", "Returning to the app...")
+                  return _response(event, 200, "Devbox is starting", "Flyte services coming up - give it another moment.")
               return _response(event, 503, "Unknown state: " + state, "Check the AWS console.")
 
+          def lambda_handler(event, _ctx):
+              h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+              path = event.get("path", "/"); qs = event.get("queryStringParameters") or {}
+              auth = h.get("authorization", ""); host = h.get("host", "")
+              redirect_uri = "https://" + host + "/oauth2/callback"
+              # Anonymous auth discovery (no token, no wake) so the CLI can log in
+              # while the box is asleep; the authenticated retry then wakes it.
+              if path.endswith("/flyteidl2.auth.AuthMetadataService/GetOAuth2Metadata"):
+                  return _proto(_meta())
+              if path.endswith("/flyteidl2.auth.AuthMetadataService/GetPublicClientConfig"):
+                  return _proto(_pcc())
+              if auth.startswith("Bearer "):
+                  if not _valid_jwt(auth[7:]):
+                      return {"statusCode": 401, "headers": {"Content-Type": "text/plain"}, "body": "unauthorized\n"}
+                  return _wake(event)
+              if path.endswith("/oauth2/callback") and qs.get("code"):
+                  if _exchange_code(qs["code"], redirect_uri):
+                      return _wake(event)
+                  return {"statusCode": 401, "headers": {"Content-Type": "text/plain"}, "body": "login failed\n"}
+              if "text/html" in h.get("accept", ""):
+                  return _login_redirect(redirect_uri)
+              return {"statusCode": 401, "headers": {"Content-Type": "text/plain"}, "body": "unauthorized\n"}
   WakeLambdaPermission:
     Type: AWS::Lambda::Permission
     Condition: WantsProdWake
@@ -1481,40 +1705,117 @@ Resources:
   # native auth). Enforced by the on-host Envoy proxy and the wake lambda.
   # Clients send it as `Authorization: Bearer <apikey>`; browsers via HTTP Basic
   # (username flyte, password = apikey).
-  ApiKeySecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: IsProd
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Retain
-    Properties:
-      Name: !Sub "${AWS::StackName}-flyte-apikey"
-      Description: "Comma-separated list of API tokens gating the Flyte UI + gRPC API. Edit 'apikey' to add/rotate (see docs/AUTH.md), then restart flyte-auth-proxy."
-      GenerateSecretString:
-        SecretStringTemplate: '{"username": "flyte"}'
-        GenerateStringKey: apikey
-        ExcludePunctuation: true
-        PasswordLength: 40
-
-  DbInstance:
-    Type: AWS::RDS::DBInstance
+  # Aurora PostgreSQL (Serverless v2) for the runs DB. Wire-compatible with
+  # Postgres, so flyte-binary connects identically (host/port/dbName/user/pw).
+  DbCluster:
+    Type: AWS::RDS::DBCluster
     Condition: IsProd
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
     Properties:
-      Engine: postgres
-      # EngineVersion omitted; AWS picks the current default for the engine.
-      DBInstanceClass: db.t3.medium   # smallest class supported by Postgres 17+
-      AllocatedStorage: "20"
-      StorageType: gp3
-      StorageEncrypted: true
-      DBName: flyte
+      Engine: aurora-postgresql
+      # EngineVersion omitted; AWS picks a current default that supports Serverless v2.
+      DatabaseName: flyte
       MasterUsername: flyte
       MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbPasswordSecret}::password}}"
       DBSubnetGroupName: !Ref DbSubnetGroup
-      VPCSecurityGroups: [!Ref DbSecurityGroup]
-      PubliclyAccessible: false
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      StorageEncrypted: true
       BackupRetentionPeriod: 7
-      MultiAZ: false   # single-AZ; v1.5 can opt into MultiAZ
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 4
+
+  DbWriter:
+    Type: AWS::RDS::DBInstance
+    Condition: IsProd
+    Properties:
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+
+  # ---- Cognito (Prod auth) -----------------------------------------------
+  # Flyte 2 OSS federates auth to an external OAuth2 server; Cognito is it.
+  # flyte-binary advertises these via AuthMetadataService; Envoy validates the
+  # JWTs (JWKS) at the edge. Humans -> PKCE (public client); CI -> M2M client.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: IsProd
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-flyte"
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+
+  UserPoolResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Condition: IsProd
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub "https://${Domain}"
+      Name: flyte
+      Scopes:
+        - ScopeName: access
+          ScopeDescription: Flyte API access
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: IsProd
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub "${AWS::StackName}-${AWS::AccountId}"
+
+  # Public client for interactive PKCE (CLI + browser); no secret.
+  UserPoolClientPkce:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: IsProd
+    DependsOn: UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: flyte-pkce
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile, !Sub "https://${Domain}/access"]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - http://localhost:8080/callback
+        - http://localhost:8089/callback
+        - !Sub "https://${Domain}/callback"
+      LogoutURLs: [!Sub "https://${Domain}/logout"]
+
+  # Machine-to-machine client for CI (client-credentials).
+  UserPoolClientM2M:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: IsProd
+    DependsOn: UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: flyte-m2m
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthScopes: [!Sub "https://${Domain}/access"]
+      SupportedIdentityProviders: [COGNITO]
+
+  # Confidential client for the Envoy oauth2 browser flow (Authorization Code +
+  # secret). Drives the cookie-based UI login; the Envoy edge holds the secret
+  # (fetched at boot via cognito-idp:DescribeUserPoolClient, never templated).
+  UserPoolClientWeb:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: IsProd
+    DependsOn: UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: flyte-web
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile, !Sub "https://${Domain}/access"]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub "https://${Domain}/oauth2/callback"]
+      LogoutURLs: [!Sub "https://${Domain}/oauth2/signout"]
 
   # ---- Image registry (ECR) ----------------------------------------------
   EcrRepository:
@@ -1564,7 +1865,9 @@ Resources:
             Action: secretsmanager:GetSecretValue
             Resource:
               - !Ref DbPasswordSecret
-              - !Ref ApiKeySecret
+          - Effect: Allow
+            Action: cognito-idp:DescribeUserPoolClient
+            Resource: !GetAtt UserPool.Arn
 
 Outputs:
   # ---- Eval mode outputs (Eval+Public) ------------------------------------
@@ -1616,20 +1919,25 @@ Outputs:
     Description: Endpoint for `flyte create config --endpoint <this>` (Prod mode; TLS by default — drop --insecure).
     Value: !Ref Domain
 
-  ApiKeyRetrieveCli:
-    Condition: IsProd
-    Description: Fetch the API key that gates the UI + gRPC API (browser uses username 'flyte' + this as the password).
-    Value: !Sub "aws secretsmanager get-secret-value --secret-id ${ApiKeySecret} --query SecretString --output text | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"apikey\"])'"
-
   ClientConfigProd:
     Condition: IsProd
-    Description: Configure the flyte CLI to send the API key as a bearer token (run ApiKeyRetrieveCli first to get the key, substitute it for <API_KEY>).
-    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type external-command --command 'echo <API_KEY>'"
+    Description: Configure the flyte CLI for Cognito SSO — first run opens a browser PKCE login.
+    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type pkce"
+
+  CognitoUserPoolId:
+    Condition: IsProd
+    Description: Cognito user pool — create login users here, e.g. `aws cognito-idp admin-create-user --user-pool-id <this> --username you@example.com`.
+    Value: !Ref UserPool
+
+  CognitoM2MClientId:
+    Condition: IsProd
+    Description: M2M (CI) client id. Get its secret via `aws cognito-idp describe-user-pool-client --user-pool-id <UserPoolId> --client-id <this>`, then client-credentials against the hosted domain /oauth2/token (scope https://<domain>/access).
+    Value: !Ref UserPoolClientM2M
 
   ProdDbEndpoint:
     Condition: IsProd
     Description: RDS Postgres endpoint for the Flyte runs DB (Prod mode; wire up via PROD_WIRING.md).
-    Value: !Sub "${DbInstance.Endpoint.Address}:${DbInstance.Endpoint.Port}"
+    Value: !Sub "${DbCluster.Endpoint.Address}:${DbCluster.Endpoint.Port}"
 
   ProdDbSecretArn:
     Condition: IsProd
