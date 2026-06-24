@@ -1,107 +1,171 @@
 # flyte-devbox-aws-marketplace
 
-A single-EC2 deployment of the [Flyte 2 devbox](https://www.union.ai/docs/v2/union/user-guide/run-modes/running-devbox/) packaged for AWS, with:
+A single-EC2 deployment of the [Flyte 2 devbox](https://www.union.ai/docs/v2/union/user-guide/run-modes/running-devbox/)
+packaged for AWS. One self-contained CloudFormation template, no build step — edit
+the YAML, deploy the YAML. The EC2 user-data, the idle-polling agent, both lambdas,
+and the auth sidecar are all embedded inline.
 
-- **S3-backed object store** (RustFS replaced via the devbox's `999-extra-config.yaml` override)
-- **In-cluster PostgreSQL on a dedicated, snapshotted EBS volume**
-- **Auto-stop** of the EC2 when no Flyte executions are running for `IdleThresholdMinutes`
-- **Auto-wake** when a user hits the ALB URL (the next request boots the EC2 and serves a "waking" page that auto-refreshes)
+It auto-stops the EC2 when no Flyte executions have run for `IdleThresholdMinutes`,
+so you only pay for compute while you're actually using it.
 
-## Architecture
+## Two deployment modes
 
-```
-                          customer browser
-                                 |
-                          (HTTP, port 80)
-                                 |
-                                 v
-                  +-----------------------------+
-                  |  Application Load Balancer  |
-                  |   default action: see note  |
-                  +-----------------------------+
-                       |                    |
-              (when EC2 running)   (when EC2 stopped)
-                       |                    |
-                       v                    v
-              +-----------------+   +-----------------+
-              |  ec2-tg         |   |  wake-tg        |
-              |  (instance:     |   |  (lambda:       |
-              |   30080)        |   |   wake handler) |
-              +-----------------+   +-----------------+
-                       |                    |
-                       v                    v
-              +-----------------+   StartInstances + 200 HTML
-              |  EC2            |   (meta-refresh; once
-              |  Ubuntu 24.04   |    healthy, flip listener
-              |  Docker         |    back to ec2-tg)
-              |  k3s (devbox)   |
-              |   :30080 UI/API |
-              |                 |
-              |  systemd:       |
-              |   flyte-devbox  |     +-------------------+
-              |   idle-agent ---+---->| CloudWatch metric |
-              +-----------------+     | FlyteDevbox/      |
-                       |              | IdleMinutes       |
-                       v              +-------------------+
-              +-----------------+              |
-              |  S3 bucket      |              v
-              |  (per stack)    |     +-------------------+
-              +-----------------+     | Alarm:            |
-                                      | IdleMinutes >=    |
-              +-----------------+     | threshold         |
-              |  EBS volume     |     +-------------------+
-              |  /var/lib/      |              |
-              |  docker         |              v
-              |  (AWS Backup)   |     +-------------------+
-              +-----------------+     | Stop lambda:      |
-                                      |  flip listener \  |
-                                      |  ec2:Stop         |
-                                      +-------------------+
-```
+The mode is chosen by **whether you set `Domain`** at deploy time.
 
-**Note on listener routing:** the listener's default action forwards to **both** target groups at all times via a weighted forward. The active TG has weight 1, the idle TG has weight 0. The wake and stop lambdas swap the weights via `elbv2:ModifyListener`. Both TGs stay registered in the listener so ALB health checks run continuously on `ec2-tg` — necessary because the wake lambda decides when to flip based on `ec2-tg` health, and ALB only runs health checks on TGs that a listener references.
+### Dev mode — ephemeral, IP-locked (no `Domain`)
+The fastest way to stand up a throwaway devbox. Everything is **in-cluster**:
+rustfs (an S3-compatible object store) and embedded PostgreSQL, both on a
+snapshotted EBS volume. **No auth** — access is locked to your IP via `AllowedCidr`
+on the security group, reached over plain HTTP on the instance's Elastic IP. Auto-stops
+when idle; restart with `aws ec2 start-instances`.
 
-A second listener rule at priority 1 catches path `=/` and 302-redirects to `/v2`, where the Flyte UI actually lives. Without it, the bare hostname lands on the devbox's `rustfs-s3` traefik ingress and returns `403 application/xml`.
+*Use it for:* quick evals, experiments, demos you'll tear down — a disposable box
+gated to your network, nothing external to manage.
 
-## Layout
+### Prod mode — durable, authenticated (`Domain` + `HostedZoneId` set)
+A persistent, shareable single-node deployment. Adds:
+- **External, durable backends** — S3 object store + **Aurora Serverless v2**
+  (PostgreSQL, scale-to-zero) + ECR, all auto-wired into Flyte at boot. Data
+  survives instance replacement.
+- **AWS Cognito auth** (OAuth2) — browser SSO, native CLI PKCE for humans,
+  client-credentials (M2M) for CI. No static secrets in client config.
+- **ALB + ACM HTTPS + Route 53** at your domain, with auth-gated auto-wake (a
+  stopped box wakes on an authenticated request).
 
-```
-cloudformation/flyte-devbox.yaml      # the deployable stack (self-contained)
-docs/DEPLOY.md                        # deploy walk-through + sanity checks
-docs/AUTH.md                          # Prod-mode auth: Cognito SSO / CLI PKCE / M2M
-```
+*Use it for:* a long-lived devbox a team can sign into over HTTPS.
 
-In **Prod mode** the UI + gRPC API authenticate with **AWS Cognito** (OAuth2):
-browser SSO, native CLI PKCE for humans, and client-credentials (M2M) for CI — no
-static secrets in client config. See **docs/AUTH.md**.
-
-The template embeds the EC2 user-data, the idle-polling agent, and both lambdas inline. There is no separate source tree and no build step: edit the YAML, deploy the YAML.
+### Beyond a single node
+This stack is intentionally **single-EC2** — simple, cheap, auto-stopping. For
+multi-node / HA / heavy concurrent use, that's the boundary: move to **EKS + the
+Flyte Helm chart** (or [Union](https://www.union.ai/) for a managed control plane).
+This template is the "one box, get going" option, not a cluster.
 
 ## Deploy
 
+The template creates its own VPC + two public subnets — no networking params to
+plumb in. (Don't pick a `VpcCidr` overlapping `10.42.0.0/16` / `10.43.0.0/16` —
+the k3s pod/service CIDRs — or in-cluster DNS breaks.) GPU is auto-detected: pick a
+GPU instance type and the devbox starts with `--gpus all`; no flag to set.
+
+**Dev mode:**
 ```bash
 aws cloudformation deploy \
   --stack-name flyte-devbox-dev \
   --template-file cloudformation/flyte-devbox.yaml \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-      AllowedCidr=YOUR_IP/32 \
+      AllowedCidr=$(curl -s ifconfig.me)/32 \
       IdleThresholdMinutes=30
 ```
 
-The template creates its own VPC and two public subnets, so there are no networking parameters to plumb in. Default `VpcCidr` is `10.20.0.0/16`.
+**Prod mode** (add a domain you control in Route 53):
+```bash
+aws cloudformation deploy \
+  --stack-name flyte-devbox-prod \
+  --template-file cloudformation/flyte-devbox.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+      Domain=flyte.example.com \
+      HostedZoneId=Z0123456789ABCDEFGHIJ \
+      AllowedCidr=0.0.0.0/0
+```
 
-> **Do not** pick a `VpcCidr` that overlaps `10.42.0.0/16` (k3s pod CIDR) or `10.43.0.0/16` (k3s service CIDR). If it overlaps, in-cluster DNS lookups inside the devbox get routed to flannel instead of the VPC resolver, and image pulls hang forever.
+Key parameters: `InstanceType` (default `m6i.2xlarge`), `DataVolumeSizeGb` (50),
+`AutoStop` (`Yes`), `StableIp` (`Yes`), `IdleThresholdMinutes` (30),
+`NoPublicIngress` (`No`). First deploy is ~5–10 min (ALB ~3 min, EC2 boot + image
+pull ~5 min; Prod also creates Cognito + Aurora).
 
-See `docs/DEPLOY.md` for the post-launch sanity checks.
+After deploy, check `Outputs`:
+```bash
+aws cloudformation describe-stacks --stack-name <stack> \
+  --query 'Stacks[0].Outputs' --output table
+```
+Prod surfaces `ClientConfigProd` (the CLI config command), `CognitoUserPoolId`,
+`CognitoM2MClientId`, plus `ProdDbEndpoint` / `BucketName` / `InstanceId`.
 
-## Now included (Prod mode)
+## Auth (Prod mode)
 
-- **HTTPS via ACM** — 443 listener + DNS-validated ACM cert + Route 53 A record (set `Domain`).
-- **External S3 + Aurora** — object store and runs DB auto-wired to the per-stack S3 bucket and Aurora Serverless v2 (PostgreSQL) at boot.
-- **Auth** — AWS Cognito (OAuth2): browser SSO, CLI PKCE, and M2M for CI (see `docs/AUTH.md`).
+Prod authenticates with **AWS Cognito**. Cognito proves *who you are* — there's no
+per-user RBAC, so every authenticated principal has full control-plane access
+(Fine grained RBAC is feature of [Union](https://www.union.ai/)).
+
+**Humans — CLI (PKCE):**
+```bash
+flyte create config --endpoint dns:///flyte.example.com:443 --auth-type pkce --project flytesnacks --domain development
+flyte run hello.py main
+```
+The first call opens a browser for Cognito login, then caches the token.
+
+**Browser — UI:** open `https://flyte.example.com/v2` → Cognito login → console.
+
+**CI — M2M (no browser):**
+```bash
+DOMAIN=https://<stack>-<account>.auth.<region>.amazoncognito.com
+TOK=$(curl -s -X POST "$DOMAIN/oauth2/token" \
+  -u "$M2M_CLIENT_ID:$M2M_CLIENT_SECRET" \
+  -d "grant_type=client_credentials&scope=https://flyte.example.com/access" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+```
+Pass it via `authType: ExternalCommand`, `command: [sh, -c, "echo $FLYTE_TOKEN"]`.
+`CognitoM2MClientId` is a stack output; the secret is on that Cognito client.
+
+**Manage users:** the pool starts empty —
+```bash
+aws cognito-idp admin-create-user --user-pool-id <CognitoUserPoolId> \
+  --username you@example.com \
+  --user-attributes Name=email,Value=you@example.com Name=email_verified,Value=true \
+  --temporary-password '<TempPass#1>' --message-action SUPPRESS --region <region>
+```
+
+**How it works:** ALB :443 → on-EC2 **Envoy** → devbox. Envoy runs `oauth2`
+(browser cookie SSO against Cognito) and `jwt_authn` (validates the Cognito bearer
+for CLI/CI). Unauthenticated **API** calls get a `401` (not a `302` redirect) so the
+SDK logs in and retries. An on-box **AuthMetadataService sidecar** serves the OAuth
+discovery RPCs native PKCE needs; the **wake Lambda** also serves them, so the CLI
+can log in even while the box is asleep.
+
+## Cost (us-east-1, on-demand estimates)
+
+Both modes **auto-stop the EC2** when idle, and Prod's Aurora **scales to zero**
+(auto-pauses after ~5 min idle, resumes in ~15 s), so an idle stack costs almost
+nothing for compute + DB.
+
+EC2 is **`m6i.2xlarge`** by default (8 vCPU / 32 GB) @ **~$0.384/hr** when running —
+~$68/mo at 8 h/day, ~$280/mo if left on 24×7. Shrink `InstanceType` (e.g.
+`m6i.xlarge`) to halve active-hour cost if the workload fits.
+
+| | Dev mode | Prod mode |
+|---|---|---|
+| **Idle** (EC2 stopped) | EIP + EBS ≈ **~$10/mo** | ALB ~$20 + EBS/EIP ~$13 + Aurora ~$0 (paused) ≈ **~$35/mo** |
+| **+ Active compute** | + EC2 hours @ $0.384/hr | + EC2 hours @ $0.384/hr + Aurora ACUs while querying (~$0.06–0.24/hr) |
+
+So a lightly-used Prod stack lands around **$50–80/mo**; Dev, **$10–40/mo**. The
+fixed costs are the ALB (~$20/mo, inherent to HTTPS/domain) and public IPv4
+addresses (~$3.60/mo each). No NAT gateways (public subnets only).
+
+## Auto-stop / wake
+
+- **Run a workflow** → idle metric stays at 0. **Stop everything** → it ticks up
+  1/min. At `IdleThresholdMinutes` → alarm → stop Lambda → listener flips to the
+  wake target → EC2 stops (Prod), Aurora pauses.
+- **Prod:** the next request hits the wake Lambda, which authenticates (browser via
+  Cognito, or CLI via discovery + bearer), starts the EC2 (~2 min boot, devbox
+  already in the Docker volume — no re-pull), then flips traffic back. Set
+  `AutoStop=No` for an always-on box.
+- **Dev:** no ALB/wake path — restart with `aws ec2 start-instances --instance-ids <id>`.
+
+## Tear down
+
+```bash
+aws cloudformation delete-stack --stack-name <stack>
+```
+The **S3 bucket**, **EBS data volume**, and **Aurora cluster** are `Retain` /
+`Snapshot` on delete — remove leftover snapshots/buckets manually once the stack is
+gone. (Running two stacks? Each has its own EC2 + EIP + EBS; Prod adds ALB +
+Aurora. Delete the one you don't need to stop paying for it.)
 
 ## What's intentionally _not_ here yet
 
-- Packer-built AMI (v1 uses vanilla Ubuntu 24.04 + user-data; once validated, we lift install steps into a Packer build for the marketplace listing)
-- ECR-backed image registry for client builds (stock tasks use the public `ghcr.io/flyteorg/flyte` image; the in-cluster registry handles custom builds)
+- **Packer-built AMI** — v1 uses vanilla Ubuntu 24.04 + user-data; once validated,
+  install steps lift into a Packer build for the marketplace listing.
+- **Per-user RBAC** — Cognito authenticates; it doesn't authorize per user (Union).

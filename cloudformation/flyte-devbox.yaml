@@ -514,22 +514,20 @@ Resources:
                   --query Parameter.Value --output text > /usr/local/bin/flyte-render-override.sh
                 chmod 0755 /usr/local/bin/flyte-render-override.sh
 
-                # Auth proxy (Prod only): an on-EC2 Envoy that sits between the ALB
-                # and the devbox and requires a static API key on every UI + gRPC
-                # request (Bearer for the CLI, HTTP Basic for the browser). The
-                # 'apikey' secret field is a COMMA-SEPARATED list of valid tokens;
-                # this builds one Bearer + one Basic Lua-table entry per token and
-                # substitutes them into the Envoy config's __OKENTRIES__ marker.
-                # /healthz + /readyz are exempt so ALB health checks pass. Flyte 2
-                # OSS has no native auth; this is the gate. Add/rotate tokens by
-                # editing the secret (see docs/AUTH.md) and restarting this service.
+                # Auth proxy (Prod only): an on-EC2 Envoy between the ALB and the
+                # devbox that gates every UI + gRPC request via AWS Cognito. The
+                # oauth2 filter handles browser SSO (cookie session); jwt_authn
+                # validates the Cognito access-token bearer for CLI/CI. The render
+                # script below fetches the web-client secret + Cognito endpoints and
+                # substitutes them into the Envoy config. /healthz + /readyz + the
+                # auth-discovery RPCs are exempt. See README "Auth (Prod mode)".
                 aws ssm get-parameter --name "$AUTHPROXY_PARAM" --region "$AWS_REGION" \
                   --query Parameter.Value --output text > /usr/local/bin/flyte-render-authproxy.sh
                 chmod 0755 /usr/local/bin/flyte-render-authproxy.sh
 
                 cat > /etc/systemd/system/flyte-auth-proxy.service <<'PROXYUNIT_EOF'
                 [Unit]
-                Description=Flyte auth proxy (Envoy) - static API key gate for UI + gRPC
+                Description=Flyte auth proxy (Envoy) - Cognito SSO + JWT gate for UI + gRPC
                 After=flyte-devbox.service network-online.target
                 Wants=network-online.target
 
@@ -946,7 +944,7 @@ Resources:
       Name: !Sub "/${AWS::StackName}/flyte/envoy.yaml"
       Type: String
       Tier: Advanced
-      Description: Envoy auth-proxy config template (__APIKEY__/__BASIC__ substituted at boot).
+      Description: Envoy auth-proxy config template (Cognito issuer/domain/client/secret substituted at boot).
       Value: |
         admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
         static_resources:
@@ -1697,10 +1695,6 @@ Resources:
         ExcludePunctuation: true
         PasswordLength: 32
 
-  # Static API key that gates the UI + gRPC API in Prod (Flyte 2 OSS has no
-  # native auth). Enforced by the on-host Envoy proxy and the wake lambda.
-  # Clients send it as `Authorization: Bearer <apikey>`; browsers via HTTP Basic
-  # (username flyte, password = apikey).
   # Aurora PostgreSQL (Serverless v2) for the runs DB. Wire-compatible with
   # Postgres, so flyte-binary connects identically (host/port/dbName/user/pw).
   DbCluster:
@@ -1719,7 +1713,11 @@ Resources:
       StorageEncrypted: true
       BackupRetentionPeriod: 7
       ServerlessV2ScalingConfiguration:
-        MinCapacity: 0.5
+        # MinCapacity 0 = scale-to-zero: the cluster auto-pauses after ~5 min idle
+        # (no ACU billing) and resumes in ~15s on the next query. Pairs with the
+        # EC2 auto-stop so an idle Prod stack costs ~$0 for compute + DB.
+        # (Requires Aurora PostgreSQL >= 16.3 / 17.x — deployed cluster is 17.7.)
+        MinCapacity: 0
         MaxCapacity: 4
 
   DbWriter:
