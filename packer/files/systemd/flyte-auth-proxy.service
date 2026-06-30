@@ -1,0 +1,19 @@
+[Unit]
+Description=Flyte auth proxy (Envoy) - Cognito SSO + JWT gate for UI + gRPC
+After=flyte-devbox.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+ExecStartPre=-/usr/bin/docker rm -f flyte-auth-proxy
+ExecStartPre=/usr/local/bin/flyte-render-authproxy.sh
+# Single line on purpose (systemd preserves leading whitespace of
+# `\`-continued lines). --entrypoint envoy bypasses the image's
+# docker-entrypoint.sh, which mangles the `-c <path>` argument.
+ExecStart=/usr/bin/docker run --rm --name flyte-auth-proxy --network host --entrypoint envoy --volume /etc/flyte-devbox/envoy.yaml:/etc/envoy/envoy.yaml:ro envoyproxy/envoy:v1.34-latest -c /etc/envoy/envoy.yaml
+ExecStop=/usr/bin/docker stop -t 10 flyte-auth-proxy
+
+[Install]
+WantedBy=multi-user.target

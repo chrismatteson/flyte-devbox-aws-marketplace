@@ -42,10 +42,18 @@ This template is the "one box, get going" option, not a cluster.
 
 ## Deploy
 
-The template creates its own VPC + two public subnets — no networking params to
+The instance launches from a **prebuilt AMI** (Docker + the devbox image + the
+auth proxy/sidecar baked in — see `packer/`), so boot is fast and self-contained.
+The template resolves the AMI from the per-region SSM parameter
+`/flyte-devbox/ami/latest` (kept current by the build pipeline); pass `AmiId=ami-…`
+to pin a specific one. It creates its own VPC + two public subnets — no networking params to
 plumb in. (Don't pick a `VpcCidr` overlapping `10.42.0.0/16` / `10.43.0.0/16` —
 the k3s pod/service CIDRs — or in-cluster DNS breaks.) GPU is auto-detected: pick a
 GPU instance type and the devbox starts with `--gpus all`; no flag to set.
+
+> The template is >51 KB, so the `aws cloudformation deploy` CLI needs an S3
+> staging bucket: add `--s3-bucket <bucket>` (any bucket you own). The console /
+> Marketplace launch path handles this for you.
 
 **Dev mode:**
 ```bash
@@ -53,8 +61,9 @@ aws cloudformation deploy \
   --stack-name flyte-devbox-dev \
   --template-file cloudformation/flyte-devbox.yaml \
   --capabilities CAPABILITY_IAM \
+  --s3-bucket <your-bucket> \
   --parameter-overrides \
-      AllowedCidr=$(curl -s ifconfig.me)/32 \
+      AllowedCidr=$(curl -s -4 ifconfig.me)/32 \
       IdleThresholdMinutes=30
 ```
 
@@ -64,6 +73,7 @@ aws cloudformation deploy \
   --stack-name flyte-devbox-prod \
   --template-file cloudformation/flyte-devbox.yaml \
   --capabilities CAPABILITY_IAM \
+  --s3-bucket <your-bucket> \
   --parameter-overrides \
       Domain=flyte.example.com \
       HostedZoneId=Z0123456789ABCDEFGHIJ \
@@ -72,8 +82,8 @@ aws cloudformation deploy \
 
 Key parameters: `InstanceType` (default `m6i.2xlarge`), `DataVolumeSizeGb` (50),
 `AutoStop` (`Yes`), `StableIp` (`Yes`), `IdleThresholdMinutes` (30),
-`NoPublicIngress` (`No`). First deploy is ~5–10 min (ALB ~3 min, EC2 boot + image
-pull ~5 min; Prod also creates Cognito + Aurora).
+`NoPublicIngress` (`No`), `AmiId` (blank = use the SSM-published latest AMI). First deploy is ~3–6 min
+(fast boot from the AMI; Prod also creates Cognito + Aurora).
 
 After deploy, check `Outputs`:
 ```bash
@@ -164,8 +174,29 @@ The **S3 bucket**, **EBS data volume**, and **Aurora cluster** are `Retain` /
 gone. (Running two stacks? Each has its own EC2 + EIP + EBS; Prod adds ALB +
 Aurora. Delete the one you don't need to stop paying for it.)
 
-## What's intentionally _not_ here yet
+## Building & development
 
-- **Packer-built AMI** — v1 uses vanilla Ubuntu 24.04 + user-data; once validated,
-  install steps lift into a Packer build for the marketplace listing.
+The runtime is baked into an AMI by Packer; `packer/files/` is the single source
+of truth for the on-box scripts + systemd units, and the CloudFormation user-data
+only does per-instance wiring.
+
+```bash
+scripts/validate.sh                      # static gate (cfn-lint, packer, shellcheck,
+                                         #   py-compile, envoy validate, user-data size)
+cd packer && packer build .              # build a new AMI (needs AWS creds)
+scripts/dev-sync.sh <stack> envoy.yaml.tmpl   # hot-patch a baked file on a running
+                                         #   box + restart its service (no rebuild)
+scripts/smoke-test.sh                    # deploy → flyte run → teardown (real AWS spend)
+```
+
+- CI: `.buildkite/pipeline.yml` runs `validate.sh` on every commit. On `main` (incl.
+  a scheduled build) it detects a new devbox release and builds → smoke-tests →
+  publishes the AMI to SSM `/flyte-devbox/ami/latest` — no per-AMI code change.
+- Releasing to AWS Marketplace: see [MARKETPLACE.md](MARKETPLACE.md).
+
+## What's intentionally _not_ here
+
 - **Per-user RBAC** — Cognito authenticates; it doesn't authorize per user (Union).
+- **Multi-region AMIs** — the SSM AMI parameter is currently seeded for `us-east-1`;
+  add regions on release (`aws ec2 copy-image` + publish each region's SSM param,
+  see MARKETPLACE.md).

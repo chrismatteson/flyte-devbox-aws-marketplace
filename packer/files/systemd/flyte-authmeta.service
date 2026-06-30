@@ -1,0 +1,14 @@
+[Unit]
+Description=Flyte AuthMetadataService sidecar (Cognito discovery for CLI PKCE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/etc/flyte-devbox/authmeta.env
+ExecStart=/opt/flyte-idle-agent/venv/bin/python /opt/flyte-authmeta/sidecar.py
+
+[Install]
+WantedBy=multi-user.target

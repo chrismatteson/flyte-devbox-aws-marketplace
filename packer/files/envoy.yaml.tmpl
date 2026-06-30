@@ -1,0 +1,127 @@
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  secrets:
+  - name: token_secret
+    generic_secret: { secret: { inline_string: "__CLIENT_SECRET__" } }
+  - name: hmac_secret
+    generic_secret: { secret: { inline_string: "__HMAC__" } }
+  listeners:
+  - name: ingress
+    address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress
+          codec_type: AUTO
+          stream_idle_timeout: 0s
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              # The ALB terminates TLS and forwards to us over cleartext, so Envoy
+              # would otherwise stamp X-Forwarded-Proto=http. Force https so the
+              # devbox (traefik -> flyte-binary) sees the real external scheme and
+              # SelectCluster returns https:// (else the SDK's data-plane upload
+              # dials :80 and hangs). Requires a devbox image whose bundled traefik
+              # trusts forwarded headers (flyteorg/flyte #7591).
+              request_headers_to_add:
+              - header: { key: "x-forwarded-proto", value: "https" }
+                append_action: OVERWRITE_IF_EXISTS_OR_ADD
+              routes:
+              - match: { prefix: "/flyteidl2.auth.AuthMetadataService" }
+                route: { cluster: authmeta, timeout: 0s }
+              - match: { prefix: "/" }
+                route: { cluster: devbox, timeout: 0s }
+          http_filters:
+          - name: envoy.filters.http.oauth2
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
+              config:
+                token_endpoint: { cluster: cognito_oauth, uri: "https://__DOMAIN__/oauth2/token", timeout: 5s }
+                authorization_endpoint: "https://__DOMAIN__/oauth2/authorize"
+                redirect_uri: "https://%REQ(:authority)%/oauth2/callback"
+                redirect_path_matcher: { path: { exact: "/oauth2/callback" } }
+                signout_path: { path: { exact: "/oauth2/signout" } }
+                forward_bearer_token: true
+                use_refresh_token: true
+                auth_type: BASIC_AUTH
+                auth_scopes: [openid, profile]
+                credentials:
+                  client_id: "__WEB_CLIENT_ID__"
+                  token_secret: { name: token_secret }
+                  hmac_secret: { name: hmac_secret }
+                pass_through_matcher:
+                - name: ":path"
+                  string_match: { prefix: "/healthz" }
+                - name: ":path"
+                  string_match: { prefix: "/readyz" }
+                - name: ":path"
+                  string_match: { prefix: "/.well-known/" }
+                - name: ":path"
+                  string_match: { prefix: "/flyteidl2.auth.AuthMetadataService" }
+                - name: "authorization"
+                  present_match: true
+                # API/gRPC requests still flow THROUGH oauth2 so the browser UI's
+                # cookie session is validated + a bearer injected for the backend.
+                # But for unauthenticated API calls (no cookie), return 401 instead
+                # of a 302 HTML redirect — the CLI/SDK needs a clean 401, and the
+                # browser SPA can handle 401 without a CORS-breaking redirect.
+                deny_redirect_matcher:
+                - name: "content-type"
+                  string_match: { prefix: "application/grpc" }
+                - name: "content-type"
+                  string_match: { prefix: "application/proto" }
+                - name: "content-type"
+                  string_match: { prefix: "application/connect" }
+          - name: envoy.filters.http.jwt_authn
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+              providers:
+                cognito:
+                  issuer: "__ISSUER__"
+                  forward: true
+                  remote_jwks:
+                    http_uri: { uri: "__ISSUER__/.well-known/jwks.json", cluster: cognito_jwks, timeout: 5s }
+                    cache_duration: 600s
+              rules:
+              - match: { prefix: "/healthz" }
+              - match: { prefix: "/readyz" }
+              - match: { prefix: "/.well-known/" }
+              - match: { prefix: "/oauth2/" }
+              - match: { prefix: "/flyteidl2.auth.AuthMetadataService" }
+              - match: { prefix: "/" }
+                requires: { provider_name: cognito }
+          - name: envoy.filters.http.router
+            typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
+  clusters:
+  - name: devbox
+    connect_timeout: 5s
+    type: STATIC
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config: { http2_protocol_options: {} }
+    load_assignment: { cluster_name: devbox, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 80 } } } } ] } ] }
+  - name: authmeta
+    connect_timeout: 5s
+    type: STATIC
+    load_assignment: { cluster_name: authmeta, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 9099 } } } } ] } ] }
+  - name: cognito_jwks
+    connect_timeout: 5s
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_ONLY
+    load_assignment: { cluster_name: cognito_jwks, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: cognito-idp.us-east-1.amazonaws.com, port_value: 443 } } } } ] } ] }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config: { "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext, sni: cognito-idp.us-east-1.amazonaws.com }
+  - name: cognito_oauth
+    connect_timeout: 5s
+    type: LOGICAL_DNS
+    dns_lookup_family: V4_ONLY
+    load_assignment: { cluster_name: cognito_oauth, endpoints: [ { lb_endpoints: [ { endpoint: { address: { socket_address: { address: __DOMAIN__, port_value: 443 } } } } ] } ] }
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config: { "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext, sni: __DOMAIN__ }

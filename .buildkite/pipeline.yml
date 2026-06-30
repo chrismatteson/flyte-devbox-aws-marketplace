@@ -1,0 +1,33 @@
+# Buildkite pipeline for flyte-devbox-aws-marketplace.
+#
+#   • static validation — runs on every commit/PR. No AWS credentials needed.
+#   • check release     — on main, detects a new devbox image (cr.flyte.org:latest
+#                         digest vs the last published AMI). On a new release it
+#                         uploads build -> smoke -> publish (.buildkite/build-publish.yml).
+#                         Between releases it is a no-op.
+#
+# AUTOMATION: add a Buildkite *Scheduled Build* on `main` (e.g. daily) so the
+# pipeline polls for new devbox releases and republishes the AMI automatically —
+# no PR per AMI. Force a rebuild any time with a build env var FORCE_BUILD=true.
+#
+# Agent requirements:
+#   default queue : docker, python3+pip, packer, shellcheck
+#   aws queue     : the above + AWS credentials (EC2/CFN/Cognito/RDS/SSM) + egress
+steps:
+  - label: ":mag: static validation"
+    key: static
+    command: |
+      python3 -m pip install --quiet --upgrade cfn-lint flyte
+      ./scripts/validate.sh
+    agents:
+      queue: "default"
+
+  - wait: ~
+
+  # Build/publish only from main (incl. scheduled builds); PRs stop at validation.
+  - label: ":mag: check for new devbox release"
+    key: check-release
+    if: build.branch == "main"
+    command: ./.buildkite/check-and-build.sh
+    agents:
+      queue: "aws"

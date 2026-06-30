@@ -1,0 +1,23 @@
+# Packer build artifacts
+packer/packer_cache/
+packer/*.manifest
+crash.log
+crash.*.log
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local env / secrets — never commit credentials
+.env
+*.pem
