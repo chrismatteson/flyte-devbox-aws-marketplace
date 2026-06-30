@@ -65,18 +65,15 @@ Parameters:
       must exist in this region).
 
   # ---- Prod mode ----------------------------------------------------------
-  # Set Domain to a hostname you control + HostedZoneId for that zone to enable
-  # an ALB with HTTPS via ACM (cert auto-validated) and a Route 53 A record.
-  # Leaves auto-stop off (Prod is meant to be always-on). Eval mode (default)
-  # keeps the direct-EIP + auto-stop pattern.
+  # Set Domain to a hostname you control to enable an ALB with HTTPS via ACM
+  # (cert auto-validated) and a Route 53 A record. The Route 53 hosted zone for
+  # the domain is discovered automatically (it must already exist in this
+  # account), so there is no zone id to look up. Eval mode (default, empty
+  # Domain) keeps the direct-EIP + auto-stop pattern.
   Domain:
     Type: String
     Default: ""
-    Description: Optional. Hostname for HTTPS access (e.g. flyte.acme.com). When set, the stack enables Prod mode (ALB + ACM + Route 53). When empty, Eval mode (direct EIP) is used.
-  HostedZoneId:
-    Type: String
-    Default: ""
-    Description: Required when Domain is set. Route 53 hosted zone ID containing Domain (used for DNS-validated ACM cert + the A record).
+    Description: Optional. Hostname for HTTPS access (e.g. flyte.acme.com). When set, the stack enables Prod mode (ALB + ACM + Route 53) and auto-discovers the hosting Route 53 zone. When empty, Eval mode (direct EIP over HTTP) is used.
 
   # ---- Private mode -------------------------------------------------------
   # Set NoPublicIngress=Yes to suppress the EIP and the public SG ingress
@@ -766,6 +763,69 @@ Resources:
           CidrIp: !Ref AllowedCidr
           Description: HTTPS
 
+  # Discover the Route 53 hosted zone for Domain so a buyer never has to find or
+  # paste a zone id — they just enter the domain. Walks parent domains and returns
+  # the most specific PUBLIC zone. Feeds the ACM cert validation + the A record.
+  HostedZoneLookupRole:
+    Type: AWS::IAM::Role
+    Condition: IsProd
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: route53-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: route53:ListHostedZonesByName
+                Resource: "*"
+
+  HostedZoneLookupFn:
+    Type: AWS::Lambda::Function
+    Condition: IsProd
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt HostedZoneLookupRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse, boto3
+          def handler(event, context):
+            try:
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}); return
+              domain = event['ResourceProperties']['Domain'].rstrip('.')
+              r53 = boto3.client('route53'); labels = domain.split('.')
+              zid = zname = None
+              for i in range(len(labels) - 1):              # most specific parent first
+                cand = '.'.join(labels[i:]) + '.'
+                for z in r53.list_hosted_zones_by_name(DNSName=cand, MaxItems='5')['HostedZones']:
+                  if z['Name'] == cand and not z['Config'].get('PrivateZone', False):
+                    zid = z['Id'].split('/')[-1]; zname = z['Name']; break
+                if zid: break
+              if not zid:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                  reason='No public Route 53 hosted zone found for ' + domain); return
+              cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                {'HostedZoneId': zid, 'HostedZoneName': zname})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e)[:200])
+
+  HostedZoneLookup:
+    Type: Custom::HostedZoneLookup
+    Condition: IsProd
+    Properties:
+      ServiceToken: !GetAtt HostedZoneLookupFn.Arn
+      Domain: !Ref Domain
+
   AlbCertificate:
     Type: AWS::CertificateManager::Certificate
     Condition: IsProd
@@ -774,7 +834,7 @@ Resources:
       ValidationMethod: DNS
       DomainValidationOptions:
         - DomainName: !Ref Domain
-          HostedZoneId: !Ref HostedZoneId
+          HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
 
   # We need TWO subnets across AZs for the ALB. Add a second one only in Prod.
   PublicSubnetB:
@@ -1150,7 +1210,7 @@ Resources:
     Type: AWS::Route53::RecordSet
     Condition: IsProd
     Properties:
-      HostedZoneId: !Ref HostedZoneId
+      HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
       Name: !Ref Domain
       Type: A
       AliasTarget:

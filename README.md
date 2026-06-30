@@ -22,7 +22,7 @@ when idle; restart with `aws ec2 start-instances`.
 *Use it for:* quick evals, experiments, demos you'll tear down — a disposable box
 gated to your network, nothing external to manage.
 
-### Prod mode — durable, authenticated (`Domain` + `HostedZoneId` set)
+### Prod mode — durable, authenticated (`Domain` set)
 A persistent, shareable single-node deployment. Adds:
 - **External, durable backends** — S3 object store + **Aurora Serverless v2**
   (PostgreSQL, scale-to-zero) + ECR, all auto-wired into Flyte at boot. Data
@@ -67,16 +67,16 @@ aws cloudformation deploy \
       IdleThresholdMinutes=30
 ```
 
-**Prod mode** (add a domain you control in Route 53):
+**Prod mode** (add a domain you control in Route 53 — its hosted zone is found
+automatically, so there's no zone id to look up):
 ```bash
 aws cloudformation deploy \
   --stack-name flyte-devbox-prod \
   --template-file cloudformation/flyte-devbox.yaml \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_NAMED_IAM \
   --s3-bucket <your-bucket> \
   --parameter-overrides \
       Domain=flyte.example.com \
-      HostedZoneId=Z0123456789ABCDEFGHIJ \
       AllowedCidr=0.0.0.0/0
 ```
 

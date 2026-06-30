@@ -5,8 +5,8 @@
 # "aws" queue. Idempotent teardown via EXIT trap.
 #
 # Required env (have sane defaults for the union-presales account):
-#   HOSTED_ZONE_ID  Route 53 zone id for DOMAIN
-#   DOMAIN          fully-qualified name for the test stack
+#   DOMAIN          fully-qualified name for the test stack (its Route 53 zone is
+#                   auto-discovered by the template — no zone id needed)
 # Optional:
 #   STACK_NAME (default flyte-devbox-smoke)  REGION (us-east-1)
 #   AWS_PROFILE (unset => ambient creds)     AMI_ID (override template default)
@@ -15,7 +15,6 @@ set -euo pipefail
 STACK_NAME="${STACK_NAME:-flyte-devbox-smoke}"
 REGION="${REGION:-us-east-1}"
 DOMAIN="${DOMAIN:-smoke.flytedemo.app}"
-HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-Z02482272DDYM8NPM2W55}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$ROOT/cloudformation/flyte-devbox.yaml"
 AWSP=(); [ -n "${AWS_PROFILE:-}" ] && AWSP=(--profile "$AWS_PROFILE")
@@ -49,10 +48,9 @@ fi
 # whose early-validation hook is flaky); template is >51 KB so stage it in S3.
 aws_ s3 cp "$TEMPLATE" "s3://$S3_BUCKET/smoke-${STACK_NAME}.yaml" >/dev/null
 aws_ cloudformation create-change-set --stack-name "$STACK_NAME" --change-set-name smoke \
-  --change-set-type CREATE --capabilities CAPABILITY_IAM \
+  --change-set-type CREATE --capabilities CAPABILITY_NAMED_IAM \
   --template-url "https://${S3_BUCKET}.s3.${REGION}.amazonaws.com/smoke-${STACK_NAME}.yaml" \
   --parameters ParameterKey=Domain,ParameterValue="$DOMAIN" \
-    ParameterKey=HostedZoneId,ParameterValue="$HOSTED_ZONE_ID" \
     ParameterKey=AllowedCidr,ParameterValue=0.0.0.0/0 \
     ParameterKey=AutoStop,ParameterValue=No \
     ParameterKey=AmiId,ParameterValue="${AMI_ID:-}" >/dev/null
