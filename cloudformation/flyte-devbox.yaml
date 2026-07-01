@@ -302,6 +302,19 @@ Resources:
       SourceSecurityGroupId: !Ref AlbSecurityGroup
       Description: From ALB only (to the on-host Envoy auth proxy)
 
+  # Public app serving: ALB -> Kourier gateway (:8081). Separate from :8080 so
+  # app traffic skips the Envoy/Cognito auth proxy (apps are public).
+  ProdIngressAppsFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsProd
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8081
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: From ALB only (to the Kourier app gateway)
+
   # -------------------------------------------------------------------------
   # Dedicated EBS volume for /var/lib/docker. Survives EC2 replacement; daily
   # AWS Backup snapshot with 7-day retention.
@@ -448,6 +461,7 @@ Resources:
                 COGNITO_WEB_CLIENT_ID=${CognitoWebClientId}
                 COGNITO_POOL_ID=${CognitoPoolId}
                 RENDER_REGION=${AwsRegion}
+                FLYTE_DOMAIN=${FlyteDomain}
                 EOF
                 chmod 0600 /etc/flyte-devbox/render.env
 
@@ -498,6 +512,9 @@ Resources:
                   --volume /var/lib/flyte-devbox-kube:/.kube \\
                   --volume /etc/flyte-devbox:/var/lib/flyte/config \\
                   --volume /var/lib/flyte-data/storage:/var/lib/flyte/storage \\
+                  --volume /opt/ecr-cred:/opt/ecr-cred:ro \\
+                  --volume /opt/flyte-devbox/k3s-config.yaml:/etc/rancher/k3s/config.yaml:ro \\
+                  --volume flyte-k3s-data:/var/lib/rancher/k3s \\
                   --publish 80:30080 \\
                   --publish 5000:30000 \\
                   --publish 30001:30001 \\
@@ -543,6 +560,10 @@ Resources:
                 if [ "${ProdMode}" = "1" ]; then
                   systemctl enable --now flyte-authmeta.service
                   systemctl enable --now flyte-auth-proxy.service
+                  # Point Knative app URLs at <app>.apps.<Domain>. Runs on every
+                  # (re)start because the k3s 'flyte' addon reseeds config-domain
+                  # to 'localhost' each time the cluster comes up.
+                  systemctl enable --now flyte-appdomain.service
                 fi
 
                 systemctl enable --now flyte-idle-agent.service
@@ -561,6 +582,7 @@ Resources:
                 CognitoDomain: !If [IsProd, !Sub "${AWS::StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com", "none"]
                 CognitoWebClientId: !If [IsProd, !Ref UserPoolClientWeb, "none"]
                 CognitoPoolId: !If [IsProd, !Ref UserPool, "none"]
+                FlyteDomain: !If [IsProd, !Ref Domain, "none"]
                 DataVolumeId: !Ref DataVolume
 
   Instance:
@@ -831,9 +853,15 @@ Resources:
     Condition: IsProd
     Properties:
       DomainName: !Ref Domain
+      # Wildcard SAN for public app serving hosts (Knative/Kourier):
+      # <app>.apps.<Domain>. One wildcard cert covers every app subdomain.
+      SubjectAlternativeNames:
+        - !Sub "*.apps.${Domain}"
       ValidationMethod: DNS
       DomainValidationOptions:
         - DomainName: !Ref Domain
+          HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
+        - DomainName: !Sub "*.apps.${Domain}"
           HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
 
   # We need TWO subnets across AZs for the ALB. Add a second one only in Prod.
@@ -909,6 +937,48 @@ Resources:
             TargetGroupArn: !Ref WakeTargetGroup
         - - Type: forward
             TargetGroupArn: !Ref Ec2TargetGroup
+
+  # =========================================================================
+  # PUBLIC APP SERVING (Knative/Kourier) — *.apps.<Domain>
+  # A dedicated TG + listener rule sends app-host traffic straight to the
+  # Kourier gateway on :8081, deliberately bypassing the Envoy/Cognito auth
+  # path AND the wake lambda: apps are public, and if the EC2 is stopped this
+  # TG is simply unhealthy (ALB returns 503) — hitting an app does NOT wake the
+  # box. Kourier host-routes to the right Knative service by the Host header.
+  # =========================================================================
+  AppsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: IsProd
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: instance
+      Port: 8081
+      Protocol: HTTP
+      # Kourier answers HTTP/1.1. An ALB health probe carries the target's IP as
+      # Host, which matches no Knative route -> Kourier returns 404; we treat that
+      # as "gateway is up" via the 200-499 matcher.
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: "200-499" }
+      Targets:
+        - Id: !Ref Instance
+          Port: 8081
+
+  AppsListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: IsProd
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values: [!Sub "*.apps.${Domain}"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AppsTargetGroup
 
   # =========================================================================
   # PROD wake-on-request mechanism (only when AutoStop=Yes)
@@ -1168,7 +1238,10 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: elasticloadbalancing.amazonaws.com
 
-  # /  ->  /v2  redirect, same as Eval mode.
+  # /  ->  /v2  redirect (UI convenience), same as Eval mode. Scoped to the
+  # primary Flyte domain ONLY — without the host-header condition this path-based
+  # rule (priority 1) also catches app hosts (*.apps.<Domain>/), 302-ing them to
+  # <app-host>/v2, which the app doesn't serve (404). Apps must reach their root.
   RootRedirectRule:
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
     Condition: IsProd
@@ -1176,6 +1249,8 @@ Resources:
       ListenerArn: !Ref HttpsListener
       Priority: 1
       Conditions:
+        - Field: host-header
+          HostHeaderConfig: { Values: [!Ref Domain] }
         - Field: path-pattern
           PathPatternConfig: { Values: ["/"] }
       Actions:
@@ -1212,6 +1287,20 @@ Resources:
     Properties:
       HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
       Name: !Ref Domain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # Wildcard for public app hosts: <app>.apps.<Domain> -> ALB. Kourier then
+  # host-routes to the matching Knative service. One record covers all apps.
+  AppsWildcardRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsProd
+    Properties:
+      HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
+      Name: !Sub "*.apps.${Domain}"
       Type: A
       AliasTarget:
         DNSName: !GetAtt LoadBalancer.DNSName
@@ -1469,6 +1558,14 @@ Outputs:
     Condition: IsProd
     Description: Flyte UI (Prod mode), HTTPS via Domain.
     Value: !Sub "https://${Domain}/v2"
+
+  AppsUrlProd:
+    Condition: IsProd
+    Description: >-
+      Public app serving base (Prod mode). Deployed flyte.App endpoints resolve to
+      <app-name>.apps.<Domain> over HTTPS. Apps are public and do NOT wake a
+      stopped EC2. Set the image registry to the stack ECR so the cluster can pull.
+    Value: !Sub "https://<app-name>.apps.${Domain}"
 
   FlyteCliEndpointProd:
     Condition: IsProd

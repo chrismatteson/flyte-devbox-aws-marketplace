@@ -40,10 +40,41 @@ python3 -m venv /opt/flyte-idle-agent/venv
 # --- Product scripts (baked; user-data renders configs from them at boot) ---
 install -m 0755 /tmp/files/render-override.sh  /usr/local/bin/flyte-render-override.sh
 install -m 0755 /tmp/files/render-authproxy.sh /usr/local/bin/flyte-render-authproxy.sh
+install -m 0755 /tmp/files/render-appdomain.sh /usr/local/bin/flyte-render-appdomain.sh
 install -m 0755 /tmp/files/gpu-setup.sh        /opt/flyte-devbox/gpu-setup.sh
 install -m 0755 /tmp/files/idle-agent.py       /opt/flyte-idle-agent/flyte_idle_agent.py
 install -m 0644 /tmp/files/authmeta-sidecar.py /opt/flyte-authmeta/sidecar.py
 install -m 0644 /tmp/files/envoy.yaml.tmpl     /opt/flyte-devbox/envoy.yaml.tmpl
+
+# --- ECR credential provider for the k3s kubelet (private-ECR app-image pulls) --
+# EKS-standard mechanism: kubelet execs this binary, which mints short-lived ECR
+# tokens from the instance role via IMDS (hop limit is 3, so it works from inside
+# the devbox container). No stored secrets; tokens auto-rotate. The node role's
+# ECR pull perms come from ProdBackendPolicy in the CloudFormation template.
+ECR_CP_VERSION="v1.30.3"
+mkdir -p /opt/ecr-cred
+curl -fsSL "https://artifacts.k8s.io/binaries/cloud-provider-aws/${ECR_CP_VERSION}/linux/amd64/ecr-credential-provider-linux-amd64" \
+  -o /opt/ecr-cred/ecr-credential-provider
+chmod 0755 /opt/ecr-cred/ecr-credential-provider
+cat > /opt/ecr-cred/config.yaml <<'ECRCFG'
+apiVersion: kubelet.config.k8s.io/v1
+kind: CredentialProviderConfig
+providers:
+- name: ecr-credential-provider
+  matchImages:
+  - "*.dkr.ecr.*.amazonaws.com"
+  - "*.dkr.ecr.*.amazonaws.com.cn"
+  defaultCacheDuration: "12h"
+  apiVersion: credentialprovider.kubelet.k8s.io/v1
+ECRCFG
+# k3s reads /etc/rancher/k3s/config.yaml regardless of the image entrypoint;
+# point the embedded kubelet at the credential provider. This file is mounted
+# into the devbox container by the user-data `docker run`.
+cat > /opt/flyte-devbox/k3s-config.yaml <<'K3SCFG'
+kubelet-arg:
+  - "image-credential-provider-config=/opt/ecr-cred/config.yaml"
+  - "image-credential-provider-bin-dir=/opt/ecr-cred"
+K3SCFG
 
 # --- Systemd units (installed, NOT enabled — user-data writes the per-instance
 #     EnvironmentFiles then `systemctl enable --now`; `enable` then persists
@@ -51,7 +82,20 @@ install -m 0644 /tmp/files/envoy.yaml.tmpl     /opt/flyte-devbox/envoy.yaml.tmpl
 install -m 0644 /tmp/files/systemd/flyte-authmeta.service   /etc/systemd/system/flyte-authmeta.service
 install -m 0644 /tmp/files/systemd/flyte-auth-proxy.service /etc/systemd/system/flyte-auth-proxy.service
 install -m 0644 /tmp/files/systemd/flyte-idle-agent.service /etc/systemd/system/flyte-idle-agent.service
+install -m 0644 /tmp/files/systemd/flyte-appdomain.service  /etc/systemd/system/flyte-appdomain.service
 systemctl daemon-reload
+
+# --- Bound the auth-proxy access log (the idle-agent reads its mtime; Envoy
+#     appends a line per non-health request). copytruncate keeps Envoy's fd. ---
+cat > /etc/logrotate.d/flyte-authproxy <<'LR'
+/var/log/flyte-authproxy/access.log {
+  daily
+  rotate 3
+  missingok
+  notifempty
+  copytruncate
+}
+LR
 
 # --- Pre-pull container images so first boot is fast / offline-tolerant ---
 docker pull "$DEVBOX_IMAGE"

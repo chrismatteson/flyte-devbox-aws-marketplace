@@ -1,0 +1,12 @@
+[Unit]
+Description=Set Knative app-serving domain to apps.<Domain> (Prod)
+After=flyte-devbox.service
+Requires=flyte-devbox.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/flyte-render-appdomain.sh
+
+[Install]
+WantedBy=multi-user.target

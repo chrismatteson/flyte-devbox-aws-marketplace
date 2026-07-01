@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Integration smoke test: deploy a throwaway Prod stack, authenticate via the
-# Cognito M2M client (no browser), run a workflow, assert it was created, then
-# tear everything down. Spends real AWS money — run manually / from the Buildkite
-# "aws" queue. Idempotent teardown via EXIT trap.
+# Cognito M2M client (no browser), run a workflow, then deploy an app built from
+# a NON-DEFAULT (custom) image and assert it serves publicly at its
+# *.apps.<Domain> URL, then tear everything down. Spends real AWS money — run
+# manually / from the Buildkite "aws" queue. Idempotent teardown via EXIT trap.
+#
+# The app step exercises the whole app path the workflow step doesn't: image
+# build + push to the stack ECR, the cluster's ECR pull (kubelet credential
+# provider), Knative/Kourier config-domain, and *.apps.<Domain> ALB routing.
+# It needs docker on the runner; without docker the app step is skipped (loudly).
 #
 # Required env (have sane defaults for the union-presales account):
 #   DOMAIN          fully-qualified name for the test stack (its Route 53 zone is
@@ -116,7 +122,74 @@ for attempt in 1 2 3 4; do
 done
 echo "$OUT" | sed 's/\x1b\[[0-9;]*m//g' | tail -8
 if [ "$OK" = 1 ]; then
-  log "✅ SMOKE PASSED — run created"
+  log "✅ Workflow run created"
 else
   log "❌ SMOKE FAILED — no run created after retries"; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# App test: custom-built (non-default) image -> stack ECR -> Knative serving.
+# ---------------------------------------------------------------------------
+if ! command -v docker >/dev/null 2>&1; then
+  log "⚠️  docker not available — SKIPPING app test (custom image build needs docker)"
+  log "✅ SMOKE PASSED — workflow run (app portion skipped)"
+  exit 0
+fi
+
+APP_NAME="smoke-app"
+ECR=$(aws_ cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --query "Stacks[0].Outputs[?OutputKey=='ProdEcrUri'].OutputValue" --output text)
+ECR_REGISTRY="${ECR%/*}"; ECR_REPO="${ECR##*/}"
+
+log "Docker login to the stack ECR ($ECR_REGISTRY)"
+aws_ ecr get-login-password | docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null 2>&1
+
+cat > "$WORK/app.py" <<PY
+import flyte, flyte.app
+# Tiny stdlib server that answers 200 on any path (covers Knative's health probe),
+# so the app needs no web framework imported locally for \`flyte deploy\`.
+_SERVER = (
+    "import http.server, socketserver\n"
+    "class H(http.server.BaseHTTPRequestHandler):\n"
+    "    def do_GET(self):\n"
+    "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
+    "    def log_message(self, *a): pass\n"
+    "socketserver.TCPServer(('', 8080), H).serve_forever()\n"
+)
+# .with_pip_packages forces a real (non-default) image build -> pushed to the
+# stack ECR; single-platform (the devbox is amd64) to keep the build fast.
+image = flyte.Image.from_debian_base(
+    python_version=(3, 12), registry="$ECR_REGISTRY", name="$ECR_REPO",
+    platform=("linux/amd64",),
+).with_pip_packages("httpx")
+app_env = flyte.app.AppEnvironment(
+    name="$APP_NAME", image=image, args=["python", "-c", _SERVER],
+    port=8080, resources=flyte.Resources(cpu="1", memory="512Mi"), requires_auth=False,
+)
+PY
+
+log "Deploying app (build custom image -> push ECR -> register)"
+if (cd "$WORK" && "$FLYTE" --config .config.yaml deploy app.py app_env) >"$WORK/deploy.log" 2>&1; then
+  sed 's/\x1b\[[0-9;]*m//g' "$WORK/deploy.log" | tail -4
+else
+  sed 's/\x1b\[[0-9;]*m//g' "$WORK/deploy.log" | tail -12
+  log "❌ APP SMOKE FAILED — deploy (build/push/register) errored"; exit 1
+fi
+
+# Public URL is <app>-<project>-<domain>.apps.<Domain> (Knative ksvc name). Poll
+# it: 200 proves the cluster pulled the ECR image, the revision is Ready, and the
+# *.apps ALB rule + wildcard cert/DNS route to it.
+APP_URL="https://${APP_NAME}-flytesnacks-development.apps.${DOMAIN}/health"
+log "Polling app URL (Knative cold start + ECR pull): $APP_URL"
+acode=""
+for i in $(seq 1 30); do
+  acode=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$APP_URL" || true)
+  echo "  attempt $i: $acode"
+  [ "$acode" = "200" ] && break
+  sleep 10
+done
+if [ "$acode" = "200" ]; then
+  log "✅ SMOKE PASSED — workflow run + custom-image app served at $APP_URL"
+else
+  log "❌ APP SMOKE FAILED — app never served 200 (last: $acode)"; exit 1
 fi

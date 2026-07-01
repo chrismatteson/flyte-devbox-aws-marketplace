@@ -16,6 +16,31 @@ static_resources:
           stat_prefix: ingress
           codec_type: AUTO
           stream_idle_timeout: 0s
+          # Access-log ONLY authenticated requests — those that passed Cognito JWT
+          # validation, detected via the jwt_authn dynamic metadata stamped below.
+          # The idle-agent watches this file's mtime: a fresh mtime means someone
+          # is authentically using the console/CLI. Health/readiness probes
+          # (/healthz, /readyz), the OAuth login flow, scanners, and any
+          # failed/unauthenticated call carry no validated payload, so they never
+          # advance the mtime and cannot keep the box awake.
+          access_log:
+          - name: envoy.access_loggers.file
+            filter:
+              metadata_filter:
+                # Only match when jwt_authn stored the validated payload.
+                matcher:
+                  filter: envoy.filters.http.jwt_authn
+                  path:
+                  - key: cognito_payload
+                  value: { present_match: true }
+                # No payload (unauthenticated) -> do not log.
+                match_if_key_not_found: { value: false }
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+              path: /var/log/flyte-authproxy/access.log
+              log_format:
+                text_format_source:
+                  inline_string: "%START_TIME(%s)%\n"
           route_config:
             name: local
             virtual_hosts:
@@ -83,6 +108,10 @@ static_resources:
                 cognito:
                   issuer: "__ISSUER__"
                   forward: true
+                  # Stamp the validated JWT payload into dynamic metadata so the
+                  # access log below can log ONLY authenticated requests (used by
+                  # the idle-agent to keep the box awake on real usage).
+                  payload_in_metadata: cognito_payload
                   remote_jwks:
                     http_uri: { uri: "__ISSUER__/.well-known/jwks.json", cluster: cognito_jwks, timeout: 5s }
                     cache_duration: 600s

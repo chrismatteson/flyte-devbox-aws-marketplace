@@ -12,7 +12,7 @@ ExecStartPre=/usr/local/bin/flyte-render-authproxy.sh
 # Single line on purpose (systemd preserves leading whitespace of
 # `\`-continued lines). --entrypoint envoy bypasses the image's
 # docker-entrypoint.sh, which mangles the `-c <path>` argument.
-ExecStart=/usr/bin/docker run --rm --name flyte-auth-proxy --network host --entrypoint envoy --volume /etc/flyte-devbox/envoy.yaml:/etc/envoy/envoy.yaml:ro envoyproxy/envoy:v1.34-latest -c /etc/envoy/envoy.yaml
+ExecStart=/usr/bin/docker run --rm --name flyte-auth-proxy --network host --entrypoint envoy --volume /etc/flyte-devbox/envoy.yaml:/etc/envoy/envoy.yaml:ro --volume /var/log/flyte-authproxy:/var/log/flyte-authproxy envoyproxy/envoy:v1.34-latest -c /etc/envoy/envoy.yaml
 ExecStop=/usr/bin/docker stop -t 10 flyte-auth-proxy
 
 [Install]

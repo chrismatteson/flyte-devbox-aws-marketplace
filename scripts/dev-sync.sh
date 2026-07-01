@@ -23,6 +23,7 @@ aws_() { aws "${AWSP[@]}" --region "$REGION" "$@"; }
 case "$FILE" in
   render-override.sh)   DEST=/usr/local/bin/flyte-render-override.sh;  MODE=755; SVC=flyte-devbox ;;
   render-authproxy.sh)  DEST=/usr/local/bin/flyte-render-authproxy.sh; MODE=755; SVC=flyte-auth-proxy ;;
+  render-appdomain.sh)  DEST=/usr/local/bin/flyte-render-appdomain.sh; MODE=755; SVC=flyte-appdomain ;;
   gpu-setup.sh)         DEST=/opt/flyte-devbox/gpu-setup.sh;           MODE=755; SVC="" ;;
   idle-agent.py)        DEST=/opt/flyte-idle-agent/flyte_idle_agent.py; MODE=755; SVC=flyte-idle-agent ;;
   authmeta-sidecar.py)  DEST=/opt/flyte-authmeta/sidecar.py;           MODE=644; SVC=flyte-authmeta ;;

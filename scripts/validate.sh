@@ -63,13 +63,16 @@ else skip "python3 not found"; fi
 section "envoy config (validate baked template)"
 if have docker; then
   tmp="$(mktemp)"
+  # The access-log dir is created at boot by render-authproxy.sh; provide an
+  # equivalent for `--mode validate` (Envoy opens the log file on init).
+  logdir="$(mktemp -d)"
   sed -e 's/__ISSUER__/https:\/\/example.com\/pool/g' -e 's/__DOMAIN__/example.auth.us-east-1.amazoncognito.com/g' \
       -e 's/__WEB_CLIENT_ID__/abc/g' -e 's/__CLIENT_SECRET__/sec/g' -e 's/__HMAC__/0123456789abcdef0123456789abcdef/g' \
       "$PFILES/envoy.yaml.tmpl" > "$tmp"
-  if docker run --rm -v "$tmp":/e.yaml --entrypoint envoy envoyproxy/envoy:v1.34-latest --mode validate -c /e.yaml >/dev/null 2>&1; then
+  if docker run --rm -v "$tmp":/e.yaml -v "$logdir":/var/log/flyte-authproxy --entrypoint envoy envoyproxy/envoy:v1.34-latest --mode validate -c /e.yaml >/dev/null 2>&1; then
     ok "envoy template validates"
   else bad "envoy --mode validate failed"; fi
-  rm -f "$tmp"
+  rm -f "$tmp"; rmdir "$logdir" 2>/dev/null || true
 else skip "docker not available (needed for envoy validate)"; fi
 
 section "user-data size (<16384 B base64)"

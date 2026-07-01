@@ -53,6 +53,12 @@ plugins:
     - _U_INSECURE: "true"
     - _U_USE_ACTIONS: "1"
 internalApps:
+  # Public app URLs: https://<app>.apps.<Domain> via the ALB wildcard. Overrides
+  # the devbox image defaults (localhost:30081) so flyte stamps the real external
+  # host into each app's status.ingress.public_url.
+  baseDomain: apps.${FLYTE_DOMAIN}
+  scheme: https
+  ingressAppsPort: 443
   defaultEnvVars:
   - AWS_REGION: $RENDER_REGION
   - AWS_DEFAULT_REGION: $RENDER_REGION
@@ -60,7 +66,7 @@ internalApps:
   - _U_INSECURE: "true"
   - _U_USE_ACTIONS: "1"
 EOF
-  echo "rendered Prod override (S3=$BUCKET_NAME RDS=$DB_HOST)"
+  echo "rendered Prod override (S3=$BUCKET_NAME RDS=$DB_HOST apps=apps.${FLYTE_DOMAIN})"
   exit 0
 fi
 
