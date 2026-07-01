@@ -505,7 +505,7 @@ Resources:
                 # doesn't immediately trip the auto-stop alarm. We mirror the
                 # same line in the idle-agent service for the EC2-boot case.
                 ExecStartPre=-/bin/rm -f /var/lib/flyte-idle-agent/state
-                ExecStart=/usr/bin/docker run --rm --name flyte-devbox \\
+                ExecStart=/usr/bin/docker run --rm --name flyte-devbox --hostname flyte-devbox \\
                   --privileged \\
                   --add-host host.docker.internal:host-gateway \\
                   --env K3S_KUBECONFIG_OUTPUT=/.kube/kubeconfig \\
@@ -1511,7 +1511,11 @@ Resources:
             Resource:
               - !Ref DbPasswordSecret
           - Effect: Allow
-            Action: cognito-idp:DescribeUserPoolClient
+            Action:
+              # DescribeUserPoolClient: fetch the confidential client secret at boot.
+              # SetUICustomization: brand the Hosted UI login page with the logo.
+              - cognito-idp:DescribeUserPoolClient
+              - cognito-idp:SetUICustomization
             Resource: !GetAtt UserPool.Arn
 
 Outputs:

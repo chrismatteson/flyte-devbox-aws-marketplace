@@ -45,6 +45,8 @@ install -m 0755 /tmp/files/gpu-setup.sh        /opt/flyte-devbox/gpu-setup.sh
 install -m 0755 /tmp/files/idle-agent.py       /opt/flyte-idle-agent/flyte_idle_agent.py
 install -m 0644 /tmp/files/authmeta-sidecar.py /opt/flyte-authmeta/sidecar.py
 install -m 0644 /tmp/files/envoy.yaml.tmpl     /opt/flyte-devbox/envoy.yaml.tmpl
+install -m 0644 /tmp/files/login-logo.png      /opt/flyte-devbox/login-logo.png
+install -m 0644 /tmp/files/login-ui.css        /opt/flyte-devbox/login-ui.css
 
 # --- ECR credential provider for the k3s kubelet (private-ECR app-image pulls) --
 # EKS-standard mechanism: kubelet execs this binary, which mints short-lived ECR
